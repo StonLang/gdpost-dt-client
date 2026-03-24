@@ -150,7 +150,7 @@ class APIClient:
             logger.error(f"Error fetching capture rules: {e}")
             return False
     
-    def upload_capture_data(self, api_id: int, request_data: Dict, response_data: Dict) -> bool:
+    def upload_capture_data(self, api_id: int, request_data: Dict, response_data: Dict, capture_data: Optional[Dict] = None) -> bool:
         """
         将捕获的数据上报到API接口2
         
@@ -180,6 +180,8 @@ class APIClient:
                 "request": request_data,
                 "response": response_data,
             }
+            if capture_data is not None:
+                payload["capture_data"] = capture_data
             
             response = self.session.post(
                 self.config.api_upload_url,
@@ -205,6 +207,7 @@ class APIClient:
         Returns:
             匹配的规则或None
         """
+        logger.info(f"method={method} protocol={protocol} host={host} port={port} path={path}")
         for rule in self._rules:
             if rule.status == "1" and rule.matches(method, protocol, host, port, path):
                 return rule

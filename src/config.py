@@ -33,8 +33,8 @@ class ClientConfig:
     log_level: str = field(default="INFO")
     log_retention_days: int = field(default=30)
     
-    # WinDivert配置
-    divert_filter: str = field(default="tcp.DstPort == 80 or tcp.DstPort == 443")
+    # WinDivert配置 - 捕获所有 TCP 出站流量（浏览器发出的请求）
+    divert_filter: str = field(default="tcp and outbound")
     divert_priority: int = field(default=0)
     
     # 代理配置（本地透明代理端口）
@@ -58,7 +58,7 @@ class ClientConfig:
             log_dir=os.getenv("LOG_DIR", "logs"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             log_retention_days=int(os.getenv("LOG_RETENTION_DAYS", "30")),
-            divert_filter=os.getenv("DIVERT_FILTER", "tcp.DstPort == 80 or tcp.DstPort == 443"),
+            divert_filter=os.getenv("DIVERT_FILTER", "tcp and outbound"),
             divert_priority=int(os.getenv("DIVERT_PRIORITY", "0")),
             proxy_host=os.getenv("PROXY_HOST", "127.0.0.1"),
             proxy_port=int(os.getenv("PROXY_PORT", "0")),

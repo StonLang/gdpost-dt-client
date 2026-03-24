@@ -58,7 +58,10 @@ class TrafficCapturer:
             )
             self._capture_thread.start()
             
-            logger.info(f"Traffic capture started on filter: {self.config.divert_filter}")
+            logger.info(f"Traffic capture started")
+            logger.info(f"Filter: {self.config.divert_filter}")
+            logger.info(f"Priority: {self.config.divert_priority}")
+            logger.info("Waiting for outbound TCP packets...")
             
         except Exception as e:
             logger.error(f"Failed to start traffic capture: {e}")
@@ -81,16 +84,57 @@ class TrafficCapturer:
         logger.info("Traffic capture stopped")
     
     def _capture_loop(self):
-        """捕获循环"""
+        """捕获循环 - 捕获并重新注入数据包，确保网络连通"""
+        packet_count = 0
+        http_count = 0
+        
         try:
             with self._handle:
+                logger.info(f"[DEBUG] Capture loop started on filter: {self.config.divert_filter}")
+                logger.info(f"[DEBUG] Waiting for packets... All captured packets will be reinjected.")
+                
                 for packet in self._handle:
                     if not self._running:
                         break
                     
+                    packet_count += 1
+                    
+                    # 每收到一个包打印一个点（进度指示）
+                    if packet_count % 10 == 0:
+                        print(".", end="", flush=True)
+                    
+                    # 每100个数据包打印一次统计
+                    if packet_count % 100 == 0:
+                        print()  # 换行
+                        logger.info(f"[DEBUG] Total packets: {packet_count}, HTTP: {http_count}")
+                    
+                    # !!! 关键：优先重新注入数据包，避免处理逻辑阻塞网络 !!!
                     try:
-                        self._process_packet(packet)
+                        self._handle.send(packet)
                     except Exception as e:
+                        logger.debug(f"Failed to reinject packet: {e}")
+                        # 注入失败时跳过后续处理，防止异常放大
+                        continue
+
+                    try:
+                        # 检测端口 9001 的流量
+                        is_target_port = (packet.dst_port == 9001 or packet.src_port == 9001)
+                        
+                        # 打印前10个数据包用于调试（显示更多信息）
+                        if packet_count <= 10 or is_target_port:
+                            src = f"{packet.src_addr}:{packet.src_port}"
+                            dst = f"{packet.dst_addr}:{packet.dst_port}"
+                            payload_len = len(packet.payload) if packet.payload else 0
+                            preview = packet.payload[:50] if packet.payload else b""
+                            print(f"\n[PACKET #{packet_count}] {src} -> {dst}, payload: {payload_len} bytes")
+                            print(f"[PREVIEW] {preview}")
+                        
+                        # 在不影响传输的前提下进行解析和日志
+                        is_http = self._process_packet(packet)
+                        if is_http:
+                            http_count += 1
+                    except Exception as e:
+                        print(f"[ERROR] Processing packet: {e}")
                         logger.debug(f"Error processing packet: {e}")
                         
         except Exception as e:
@@ -98,18 +142,64 @@ class TrafficCapturer:
                 logger.error(f"Capture loop error: {e}")
     
     def _process_packet(self, packet):
-        """处理单个数据包"""
+        """处理单个数据包，返回是否成功识别为 HTTP"""
         if not packet.payload:
-            return
+            return False
         
         # 尝试解析 HTTP 请求
         payload = packet.payload
         
         # 检查是否是 HTTP 请求（简单检查）
         http_methods = (b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"PATC")
-        if not any(payload.startswith(method) for method in http_methods):
-            # 不是 HTTP 请求，直接放行
-            return
+        is_http = any(payload.startswith(method) for method in http_methods)
+        is_http_response = payload.startswith(b"HTTP/")
+        
+        if not is_http and not is_http_response:
+            # 尝试解析 HTTPS/TLS ClientHello 的 SNI（域名）
+            tls_sni = self._parse_tls_sni(payload)
+            if tls_sni:
+                src_addr = packet.src_addr
+                src_port = packet.src_port
+                dst_addr = packet.dst_addr
+                dst_port = packet.dst_port
+                path = "/"
+                protocol = "https"
+                method = "CONNECT"
+                url = f"{protocol}://{tls_sni}{path}"
+
+                logger.info(
+                    f"[CAPTURED-HTTPS] {method} {url} | "
+                    f"Src: {src_addr}:{src_port} -> Dst: {dst_addr}:{dst_port}"
+                )
+
+                if self._packet_callback:
+                    self._packet_callback(
+                        src_addr=src_addr,
+                        src_port=src_port,
+                        dst_addr=dst_addr,
+                        dst_port=dst_port,
+                        payload=payload,
+                        http_info={
+                            "method": method,
+                            "protocol": protocol,
+                            "host": tls_sni,
+                            "path": path,
+                            "version": "TLS",
+                            "headers": "",
+                            "message_type": "request",
+                        },
+                        packet=packet
+                    )
+                return True
+
+            # 不是 HTTP/HTTPS 请求，打印到 DEBUG 避免刷屏
+            if len(payload) > 0:
+                preview = payload[:100]
+                logger.debug(f"[NON-HTTP] {packet.src_addr}:{packet.src_port} -> {packet.dst_addr}:{packet.dst_port}")
+                logger.debug(f"[NON-HTTP] First 100 bytes: {preview}")
+
+            # 非 HTTP/HTTPS 请求，直接放行
+            return False
         
         # 提取源和目标信息
         src_addr = packet.src_addr
@@ -120,18 +210,55 @@ class TrafficCapturer:
         # 解析 HTTP 请求基本信息
         try:
             http_info = self._parse_http_request(payload)
-            if http_info and self._packet_callback:
-                self._packet_callback(
-                    src_addr=src_addr,
-                    src_port=src_port,
-                    dst_addr=dst_addr,
-                    dst_port=dst_port,
-                    payload=payload,
-                    http_info=http_info,
-                    packet=packet
-                )
+            if http_info:
+                # 打印调试信息：捕获到的 HTTP 请求
+                host = http_info.get('host') or dst_addr
+                protocol = http_info.get('protocol', 'http')
+                method = http_info.get('method', 'UNKNOWN')
+                path = http_info.get('path', '/')
+                url = f"{protocol}://{host}{path}"
+                
+                logger.info(f"[CAPTURED] {method} {url} | Src: {src_addr}:{src_port} -> Dst: {dst_addr}:{dst_port}")
+                
+                if self._packet_callback:
+                    self._packet_callback(
+                        src_addr=src_addr,
+                        src_port=src_port,
+                        dst_addr=dst_addr,
+                        dst_port=dst_port,
+                        payload=payload,
+                        http_info=http_info,
+                        packet=packet
+                    )
+                return True
         except Exception as e:
             logger.debug(f"Failed to parse HTTP request: {e}")
+
+        # 尝试解析 HTTP 响应
+        if is_http_response:
+            try:
+                response_info = self._parse_http_response(payload)
+                if response_info:
+                    logger.info(
+                        f"[CAPTURED-RESP] {response_info.get('status_code', 0)} "
+                        f"{response_info.get('reason', '')} | "
+                        f"Src: {src_addr}:{src_port} -> Dst: {dst_addr}:{dst_port}"
+                    )
+                    if self._packet_callback:
+                        self._packet_callback(
+                            src_addr=src_addr,
+                            src_port=src_port,
+                            dst_addr=dst_addr,
+                            dst_port=dst_port,
+                            payload=payload,
+                            http_info=response_info,
+                            packet=packet
+                        )
+                    return True
+            except Exception as e:
+                logger.debug(f"Failed to parse HTTP response: {e}")
+        
+        return False
     
     def _parse_http_request(self, payload: bytes) -> Optional[dict]:
         """
@@ -181,12 +308,137 @@ class TrafficCapturer:
                 'host': host,
                 'protocol': protocol,
                 'version': version,
-                'headers': headers_data
+                'headers': headers_data,
+                'message_type': 'request',
             }
             
         except Exception as e:
             logger.debug(f"HTTP parse error: {e}")
             return None
+
+    def _parse_http_response(self, payload: bytes) -> Optional[dict]:
+        """简单解析 HTTP 响应"""
+        try:
+            header_end = payload.find(b"\r\n\r\n")
+            if header_end == -1:
+                return None
+
+            headers_bytes = payload[:header_end]
+            body = payload[header_end + 4:]
+            headers_data = headers_bytes.decode("utf-8", errors="ignore")
+            lines = headers_data.split("\r\n")
+            if not lines:
+                return None
+
+            status_line = lines[0]
+            parts = status_line.split(" ", 2)
+            if len(parts) < 2:
+                return None
+
+            version = parts[0]
+            status_code = int(parts[1]) if parts[1].isdigit() else 0
+            reason = parts[2] if len(parts) > 2 else ""
+
+            return {
+                "version": version,
+                "status_code": status_code,
+                "reason": reason,
+                "headers": headers_data,
+                "body": body,
+                "message_type": "response",
+            }
+        except Exception as e:
+            logger.debug(f"HTTP response parse error: {e}")
+            return None
+
+    def _parse_tls_sni(self, payload: bytes) -> Optional[str]:
+        """
+        解析 TLS ClientHello 中的 SNI 主机名。
+        只处理典型的 TLS 握手首包，不完整或非握手数据返回 None。
+        """
+        try:
+            # TLS record header: type(1) + version(2) + length(2)
+            if len(payload) < 5 or payload[0] != 0x16:
+                return None
+
+            record_len = int.from_bytes(payload[3:5], byteorder="big")
+            if len(payload) < 5 + record_len:
+                # 可能是分片，保守处理
+                return None
+
+            # Handshake message starts at offset 5
+            hs_offset = 5
+            if len(payload) < hs_offset + 4:
+                return None
+
+            handshake_type = payload[hs_offset]
+            if handshake_type != 0x01:  # client_hello
+                return None
+
+            hs_len = int.from_bytes(payload[hs_offset + 1:hs_offset + 4], byteorder="big")
+            hs_end = hs_offset + 4 + hs_len
+            if len(payload) < hs_end:
+                return None
+
+            i = hs_offset + 4
+            # client_version(2) + random(32)
+            i += 2 + 32
+            if i >= hs_end:
+                return None
+
+            # session_id
+            sid_len = payload[i]
+            i += 1 + sid_len
+            if i + 2 > hs_end:
+                return None
+
+            # cipher_suites
+            cs_len = int.from_bytes(payload[i:i + 2], byteorder="big")
+            i += 2 + cs_len
+            if i >= hs_end:
+                return None
+
+            # compression_methods
+            comp_len = payload[i]
+            i += 1 + comp_len
+            if i + 2 > hs_end:
+                return None
+
+            # extensions
+            ext_total_len = int.from_bytes(payload[i:i + 2], byteorder="big")
+            i += 2
+            ext_end = min(i + ext_total_len, hs_end)
+
+            while i + 4 <= ext_end:
+                ext_type = int.from_bytes(payload[i:i + 2], byteorder="big")
+                ext_len = int.from_bytes(payload[i + 2:i + 4], byteorder="big")
+                i += 4
+                if i + ext_len > ext_end:
+                    return None
+
+                # server_name extension
+                if ext_type == 0x0000 and ext_len >= 5:
+                    # list_len(2) + name_type(1) + name_len(2) + name
+                    list_len = int.from_bytes(payload[i:i + 2], byteorder="big")
+                    j = i + 2
+                    list_end = min(j + list_len, i + ext_len)
+
+                    while j + 3 <= list_end:
+                        name_type = payload[j]
+                        name_len = int.from_bytes(payload[j + 1:j + 3], byteorder="big")
+                        j += 3
+                        if j + name_len > list_end:
+                            break
+                        if name_type == 0:
+                            return payload[j:j + name_len].decode("utf-8", errors="ignore")
+                        j += name_len
+
+                i += ext_len
+
+        except Exception as e:
+            logger.debug(f"TLS SNI parse error: {e}")
+
+        return None
     
     @property
     def is_running(self) -> bool:
