@@ -59,14 +59,12 @@
 使用 WinDivert 捕获网络流量的核心模块。
 
 **功能**：
-- 在内核层拦截 HTTP/HTTPS 出站流量
-- 解析 TCP 数据包，提取 HTTP 请求信息
+- 在内核层拦截 HTTP/HTTPS 出入站流量
+- 解析 TCP 数据包，提取 HTTP 请求/响应信息
 - 回调机制通知代理处理器
 
 **关键类**：
 - `TrafficCapturer`: 流量捕获主类
-- `CapturedRequest`: 捕获请求的数据结构
-- `PacketModifier`: 数据包修改工具
 
 ### 2. Server Client (`src/api_client.py`)
 

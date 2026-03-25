@@ -75,7 +75,7 @@ class CaptureRule:
         if self.req_protocol.upper() != protocol.upper():
             return False
         
-        # 主机匹配
+        # 主机匹配（区分大小写，与规则字段一致；调用方传入已规范化的主机名）
         if self.req_host != host:
             return False
         
@@ -84,9 +84,18 @@ class CaptureRule:
         if rule_port != 0 and rule_port != port:
             return False
         
-        # 路径匹配（支持前缀匹配）
-        if not path.startswith(self.req_path.rstrip("*")):
-            return False
+        # 路径匹配：规则以 * 结尾时为前缀匹配，否则为路径完全匹配（不含查询串）
+        path_only = path.split("?", 1)[0]
+        req_path = self.req_path
+        if req_path.endswith("*"):
+            prefix = req_path[:-1]
+            if not path_only.startswith(prefix):
+                return False
+        else:
+            a = path_only.rstrip("/") or "/"
+            b = req_path.rstrip("/") or "/"
+            if a != b:
+                return False
         
         return True
 

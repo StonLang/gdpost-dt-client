@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .api_client import APIClient, CaptureRule
 from .config import ClientConfig
-from .logger import log_matched_request, log_unmatched_request
+from .logger import log_matched_request
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +38,24 @@ class TransparentProxyHandler:
     def _handle_http_request(self, src_addr: str, src_port: int, dst_addr: str, dst_port: int,
                              payload: bytes, http_info: dict) -> bool:
         method = http_info.get("method", "GET")
-        protocol = http_info.get("protocol", "http")
-        host = http_info.get("host", dst_addr)
+        protocol = (http_info.get("protocol", "http") or "http").lower()
+        host = self._normalize_host(http_info.get("host") or str(dst_addr))
         path = http_info.get("path", "/")
+        path_for_rule = self._normalize_request_path_for_match(path)
 
-        # 仅对接口1规则命中的请求建会话
-        rule = self.api_client.find_matching_rule(method, protocol, host, dst_port, path)
+        # 仅当与接口1 规则完全一致（主机/端口/协议/方法/路径）时才建会话并抓包上报
+        rule = self.api_client.find_matching_rule(
+            method, protocol, host, dst_port, path_for_rule
+        )
+
+        url = self._format_request_url(method, protocol, host, dst_port, path)
+        logger.info(f"[地址] {url}")
+        
         if not rule:
-            log_unmatched_request(method, protocol, host, dst_port, path)
+            # 未命中规则：不写 matched 日志、不上报、不建会话
             return False
+
+        logger.info(f"[成功匹配地址] {url}")
 
         request_headers_raw, request_body_bytes = self._split_http_payload(payload)
         request_headers = self._headers_text_to_dict(request_headers_raw or http_info.get("headers", ""))
@@ -64,7 +73,7 @@ class TransparentProxyHandler:
                         "protocol": protocol,
                         "host": host,
                         "port": dst_port,
-                        "path": path,
+                        "path": path_for_rule,
                     },
                     "headers": request_headers,
                     "params": {
@@ -144,6 +153,38 @@ class TransparentProxyHandler:
     @staticmethod
     def _build_flow_key(src_addr: str, src_port: int, dst_addr: str, dst_port: int) -> str:
         return f"{src_addr}:{src_port}->{dst_addr}:{dst_port}"
+
+    @staticmethod
+    def _normalize_host(host: str) -> str:
+        """去掉 Host 头中的端口（若存在），便于与规则中的 req_host 一致。"""
+        if not host:
+            return host
+        host = host.strip()
+        if host.startswith("["):
+            return host
+        if ":" in host:
+            tail = host.rsplit(":", 1)[-1]
+            if tail.isdigit():
+                return host.rsplit(":", 1)[0]
+        return host
+
+    @staticmethod
+    def _normalize_request_path_for_match(path: str) -> str:
+        """绝对 URL 请求行时只取 path 部分；查询串不参与路径匹配。"""
+        if not path:
+            return "/"
+        if path.startswith("http://") or path.startswith("https://"):
+            p = urlparse(path)
+            return p.path or "/"
+        return path.split("?", 1)[0]
+
+    @staticmethod
+    def _format_request_url(method: str, protocol: str, host: str, port: int, path: str) -> str:
+        """用于未匹配时仅打印的可读请求地址。"""
+        default_port = 80 if protocol == "http" else 443
+        if port and port != default_port:
+            return f"{method} {protocol}://{host}:{port}{path}"
+        return f"{method} {protocol}://{host}{path}"
 
     @staticmethod
     def _split_http_payload(payload: bytes):

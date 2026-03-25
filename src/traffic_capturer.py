@@ -85,8 +85,8 @@ class TrafficCapturer:
     
     def _capture_loop(self):
         """捕获循环 - 捕获并重新注入数据包，确保网络连通"""
-        packet_count = 0
-        http_count = 0
+        # packet_count = 0
+        # http_count = 0
         
         try:
             with self._handle:
@@ -97,16 +97,16 @@ class TrafficCapturer:
                     if not self._running:
                         break
                     
-                    packet_count += 1
+                    # packet_count += 1
                     
-                    # 每收到一个包打印一个点（进度指示）
-                    if packet_count % 10 == 0:
-                        print(".", end="", flush=True)
+                    # # 每收到一个包打印一个点（进度指示）
+                    # if packet_count % 10 == 0:
+                    #     print(".", end="", flush=True)
                     
-                    # 每100个数据包打印一次统计
-                    if packet_count % 100 == 0:
-                        print()  # 换行
-                        logger.info(f"[DEBUG] Total packets: {packet_count}, HTTP: {http_count}")
+                    # # 每100个数据包打印一次统计
+                    # if packet_count % 100 == 0:
+                    #     print()  # 换行
+                    #     logger.info(f"[DEBUG] Total packets: {packet_count}, HTTP: {http_count}")
                     
                     # !!! 关键：优先重新注入数据包，避免处理逻辑阻塞网络 !!!
                     try:
@@ -117,19 +117,19 @@ class TrafficCapturer:
                         continue
 
                     try:
-                        # 仅在前若干个包打印详细调试信息（不区分端口）
-                        if packet_count <= 10:
-                            src = f"{packet.src_addr}:{packet.src_port}"
-                            dst = f"{packet.dst_addr}:{packet.dst_port}"
-                            payload_len = len(packet.payload) if packet.payload else 0
-                            preview = packet.payload[:50] if packet.payload else b""
-                            print(f"\n[PACKET #{packet_count}] {src} -> {dst}, payload: {payload_len} bytes")
-                            print(f"[PREVIEW] {preview}")
+                        # # 仅在前若干个包打印详细调试信息（不区分端口）
+                        # if packet_count <= 10:
+                        #     src = f"{packet.src_addr}:{packet.src_port}"
+                        #     dst = f"{packet.dst_addr}:{packet.dst_port}"
+                        #     payload_len = len(packet.payload) if packet.payload else 0
+                        #     preview = packet.payload[:50] if packet.payload else b""
+                        #     print(f"\n[PACKET #{packet_count}] {src} -> {dst}, payload: {payload_len} bytes")
+                        #     print(f"[PREVIEW] {preview}")
                         
                         # 在不影响传输的前提下进行解析和日志
                         is_http = self._process_packet(packet)
-                        if is_http:
-                            http_count += 1
+                        # if is_http:
+                        #     http_count += 1
                     except Exception as e:
                         print(f"[ERROR] Processing packet: {e}")
                         logger.debug(f"Error processing packet: {e}")
@@ -162,13 +162,6 @@ class TrafficCapturer:
                 path = "/"
                 protocol = "https"
                 method = "CONNECT"
-                url = f"{protocol}://{tls_sni}{path}"
-
-                logger.info(
-                    f"[CAPTURED-HTTPS] {method} {url} | "
-                    f"Src: {src_addr}:{src_port} -> Dst: {dst_addr}:{dst_port}"
-                )
-
                 if self._packet_callback:
                     self._packet_callback(
                         src_addr=src_addr,
@@ -208,15 +201,6 @@ class TrafficCapturer:
         try:
             http_info = self._parse_http_request(payload)
             if http_info:
-                # 打印调试信息：捕获到的 HTTP 请求
-                host = http_info.get('host') or dst_addr
-                protocol = http_info.get('protocol', 'http')
-                method = http_info.get('method', 'UNKNOWN')
-                path = http_info.get('path', '/')
-                url = f"{protocol}://{host}{path}"
-                
-                logger.info(f"[CAPTURED] {method} {url} | Src: {src_addr}:{src_port} -> Dst: {dst_addr}:{dst_port}")
-                
                 if self._packet_callback:
                     self._packet_callback(
                         src_addr=src_addr,
@@ -236,11 +220,6 @@ class TrafficCapturer:
             try:
                 response_info = self._parse_http_response(payload)
                 if response_info:
-                    logger.info(
-                        f"[CAPTURED-RESP] {response_info.get('status_code', 0)} "
-                        f"{response_info.get('reason', '')} | "
-                        f"Src: {src_addr}:{src_port} -> Dst: {dst_addr}:{dst_port}"
-                    )
                     if self._packet_callback:
                         self._packet_callback(
                             src_addr=src_addr,
