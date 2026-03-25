@@ -79,8 +79,9 @@ class CaptureRule:
         if self.req_host != host:
             return False
         
-        # 端口匹配
-        if int(self.req_port) != port:
+        # 端口匹配：规则中端口为 0 表示任意端口
+        rule_port = int(self.req_port)
+        if rule_port != 0 and rule_port != port:
             return False
         
         # 路径匹配（支持前缀匹配）
@@ -207,7 +208,6 @@ class APIClient:
         Returns:
             匹配的规则或None
         """
-        logger.info(f"method={method} protocol={protocol} host={host} port={port} path={path}")
         for rule in self._rules:
             if rule.status == "1" and rule.matches(method, protocol, host, port, path):
                 return rule

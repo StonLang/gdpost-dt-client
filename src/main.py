@@ -25,39 +25,40 @@ def main():
     logger = logging.getLogger(__name__)
     
     logger.info("=" * 60)
-    logger.info("gdpost-dt-client Starting...")
+    logger.info("gdpost-dt-client 正在启动...")
     logger.info("=" * 60)
     
     # 创建API客户端
     api_client = APIClient(config)
     
-    # 初始获取规则
-    logger.info("Fetching capture rules from API...")
+    # 启动时从接口拉取一次捕获规则
+    logger.info("正在从 API 获取捕获规则...")
     if not api_client.fetch_capture_rules():
-        logger.error("Failed to fetch initial rules, starting with empty rules")
+        logger.error("获取初始规则失败，将以空规则启动")
     else:
-        logger.info(f"Loaded {len(api_client.rules)} capture rules")
+        logger.info(f"已加载 {len(api_client.rules)} 条捕获规则")
     
     # 创建代理处理器
     proxy_handler = TransparentProxyHandler(config, api_client)
     
-    # 创建流量捕获器
+    # 创建并启动流量捕获（需管理员权限以加载 WinDivert）
     try:
         capturer = TrafficCapturer(config)
+        # 每个捕获到的数据包交给透明代理处理器解析、匹配与上报
         capturer.set_packet_callback(
             lambda **kwargs: proxy_handler.handle_request(**kwargs)
         )
         capturer.start()
-        logger.info("Traffic capture started (requires admin privileges)")
+        logger.info("流量捕获已启动（需要管理员权限）")
     except ImportError as e:
-        logger.error(f"Traffic capture unavailable: {e}")
-        logger.info("Running in API polling mode only")
+        logger.error(f"无法启用流量捕获: {e}")
+        logger.info("当前仅以轮询 API 模式运行（不抓包）")
         capturer = None
     except Exception as e:
-        logger.error(f"Failed to start traffic capture: {e}")
+        logger.error(f"启动流量捕获失败: {e}")
         capturer = None
     
-    # 启动规则刷新线程
+    # 后台线程：按间隔定时刷新捕获规则
     stop_event = threading.Event()
     
     def refresh_loop():
@@ -65,21 +66,21 @@ def main():
             time.sleep(config.poll_interval)
             if stop_event.is_set():
                 break
-            logger.info("Refreshing capture rules...")
+            logger.info("正在刷新捕获规则...")
             if api_client.fetch_capture_rules():
-                logger.info(f"Rules refreshed: {len(api_client.rules)} rules loaded")
+                logger.info(f"规则已刷新，当前共 {len(api_client.rules)} 条")
     
     refresh_thread = threading.Thread(target=refresh_loop, name="RuleRefreshThread", daemon=True)
     refresh_thread.start()
     
     logger.info("=" * 60)
-    logger.info("gdpost-dt-client Started Successfully!")
-    logger.info("Press Ctrl+C to stop")
+    logger.info("gdpost-dt-client 启动成功")
+    logger.info("按 Ctrl+C 可停止运行")
     logger.info("=" * 60)
     
-    # 信号处理
+    # 注册退出信号（Ctrl+C / 终止）
     def signal_handler(sig, frame):
-        logger.info(f"Received signal {sig}, stopping...")
+        logger.info(f"收到信号 {sig}，正在停止...")
         stop_event.set()
         if capturer:
             capturer.stop()
@@ -88,17 +89,18 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # 主循环
+    # 主线程阻塞等待（由信号或键盘中断结束）
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        logger.info("Stopping client...")
+        logger.info("正在停止客户端...")
         stop_event.set()
         if capturer:
             capturer.stop()
-        logger.info("Client stopped")
+        logger.info("客户端已停止")
 
 
 if __name__ == "__main__":
+    # 直接运行本模块时执行入口
     main()

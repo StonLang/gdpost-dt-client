@@ -61,7 +61,7 @@ class TrafficCapturer:
             logger.info(f"Traffic capture started")
             logger.info(f"Filter: {self.config.divert_filter}")
             logger.info(f"Priority: {self.config.divert_priority}")
-            logger.info("Waiting for outbound TCP packets...")
+            logger.info("Waiting for TCP packets...")
             
         except Exception as e:
             logger.error(f"Failed to start traffic capture: {e}")
@@ -117,11 +117,8 @@ class TrafficCapturer:
                         continue
 
                     try:
-                        # 检测端口 9001 的流量
-                        is_target_port = (packet.dst_port == 9001 or packet.src_port == 9001)
-                        
-                        # 打印前10个数据包用于调试（显示更多信息）
-                        if packet_count <= 10 or is_target_port:
+                        # 仅在前若干个包打印详细调试信息（不区分端口）
+                        if packet_count <= 10:
                             src = f"{packet.src_addr}:{packet.src_port}"
                             dst = f"{packet.dst_addr}:{packet.dst_port}"
                             payload_len = len(packet.payload) if packet.payload else 0
