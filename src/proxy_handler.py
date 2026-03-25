@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urlparse
 
 from .api_client import APIClient, CaptureRule
@@ -22,6 +23,8 @@ class TransparentProxyHandler:
         self.api_client = api_client
         self._pending_requests = {}
         self._pending_lock = threading.Lock()
+        # 上传放到单线程 executor，避免阻塞解析线程/抓包线程
+        self._upload_executor = ThreadPoolExecutor(max_workers=1)
 
     def handle_request(self, src_addr: str, src_port: int, dst_addr: str, dst_port: int,
                        payload: bytes, http_info: dict, packet: object) -> bool:
@@ -32,7 +35,9 @@ class TransparentProxyHandler:
         """
         message_type = http_info.get("message_type", "request")
         if message_type == "response":
+            logger.info(f"222222222222222222")
             return self._handle_http_response(src_addr, src_port, dst_addr, dst_port, payload, http_info)
+        logger.info(f"1111111111111")
         return self._handle_http_request(src_addr, src_port, dst_addr, dst_port, payload, http_info)
 
     def _handle_http_request(self, src_addr: str, src_port: int, dst_addr: str, dst_port: int,
@@ -49,7 +54,8 @@ class TransparentProxyHandler:
         )
 
         url = self._format_request_url(method, protocol, host, dst_port, path)
-        logger.info(f"[地址] {url}")
+        # 避免对每个 HTTP 包都写日志导致抓包线程被 I/O 拖慢
+        # logger.info(f"[地址] {url}")
         
         if not rule:
             # 未命中规则：不写 matched 日志、不上报、不建会话
@@ -60,8 +66,17 @@ class TransparentProxyHandler:
         request_headers_raw, request_body_bytes = self._split_http_payload(payload)
         request_headers = self._headers_text_to_dict(request_headers_raw or http_info.get("headers", ""))
         request_body_text = self._decode_body(request_body_bytes)
+        # 限制上传体积，避免同步上传大响应导致浏览器超时/卡转
+        max_body_for_upload = 200 * 1024  # 200KB
+        if len(request_body_text) > max_body_for_upload:
+            request_body_text = request_body_text[:max_body_for_upload] + "...[truncated]"
         request_query = self._extract_query_params(path)
         request_body_params = self._extract_body_params(request_headers, request_body_text)
+
+        # logger.info(f"request_headers={request_headers}")
+        # logger.info(f"request_body_text={request_body_text}")
+        # logger.info(f"request_query={request_query}")
+        # logger.info(f"request_body_params={request_body_params}")
 
         flow_key = self._build_flow_key(src_addr, src_port, dst_addr, dst_port)
         with self._pending_lock:
@@ -104,6 +119,19 @@ class TransparentProxyHandler:
         response_headers = self._headers_text_to_dict(response_headers_raw or http_info.get("headers", ""))
         response_body_text = self._decode_body(response_body_bytes if response_body_bytes else http_info.get("body", b""))
 
+        # 限制上传体积 + 降低日志体积
+        max_body_for_upload = 200 * 1024  # 200KB
+        if len(response_body_text) > max_body_for_upload:
+            response_body_text = response_body_text[:max_body_for_upload] + "...[truncated]"
+        response_body_preview_max = 2000
+        response_body_preview = response_body_text
+        if len(response_body_preview) > response_body_preview_max:
+            response_body_preview = response_body_preview[:response_body_preview_max] + "...[truncated]"
+
+        # 响应体可能很大，降噪避免拖慢解析线程（抓包已解耦，但仍建议少写日志）
+        logger.debug(f"response_headers_keys={list(response_headers.keys())}")
+        logger.debug(f"response_body_preview={response_body_preview}")
+
         response_obj = {
             "line": {
                 "version": http_info.get("version", "HTTP/1.1"),
@@ -118,7 +146,6 @@ class TransparentProxyHandler:
 
         capture_json = {
             "api_id": rule.api_id,
-            "api_code": rule.api_code,
             "api_name": rule.api_name,
             "network": {
                 "request": request_obj,
@@ -126,28 +153,31 @@ class TransparentProxyHandler:
             }
         }
 
-        upload_status = "FAILED"
-        try:
-            success = self.api_client.upload_capture_data(
-                rule.api_id,
-                request_data=request_obj,
-                response_data=response_obj,
-                capture_data=capture_json,
-            )
-            upload_status = "SUCCESS" if success else "FAILED"
-        except Exception as e:
-            logger.error(f"Upload failed: {e}")
-
         req_line = request_obj["line"]
-        log_matched_request(
-            req_line["method"],
-            req_line["protocol"],
-            req_line["host"],
-            req_line["port"],
-            req_line["path"],
-            rule.api_id,
-            upload_status,
-        )
+        # 异步上传（并在完成后写 matched 日志）
+        def _upload_task():
+            upload_status = "FAILED"
+            try:
+                success = self.api_client.upload_capture_data(
+                    rule.api_id,
+                    request_data=request_obj,
+                    response_data=response_obj,
+                    capture_data=capture_json,
+                )
+                upload_status = "SUCCESS" if success else "FAILED"
+            except Exception as e:
+                logger.error(f"Upload failed: {e}")
+            log_matched_request(
+                req_line["method"],
+                req_line["protocol"],
+                req_line["host"],
+                req_line["port"],
+                req_line["path"],
+                rule.api_id,
+                upload_status,
+            )
+
+        self._upload_executor.submit(_upload_task)
         return True
 
     @staticmethod

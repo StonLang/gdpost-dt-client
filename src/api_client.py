@@ -193,6 +193,10 @@ class APIClient:
             if capture_data is not None:
                 payload["capture_data"] = capture_data
             
+
+            
+            logger.debug(f"payload={payload}")
+
             response = self.session.post(
                 self.config.api_upload_url,
                 headers=headers,

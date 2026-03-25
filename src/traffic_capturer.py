@@ -2,9 +2,12 @@
 流量捕获模块 - 使用 WinDivert 捕获网络流量
 """
 import logging
+import queue
+import time
 import socket
 import struct
 import threading
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 try:
@@ -16,6 +19,16 @@ except ImportError:
 from .config import ClientConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _CapturedPacket:
+    """把 pydivert Packet 提取成纯数据，避免解析线程依赖 pydivert 对象生命周期。"""
+    src_addr: str
+    src_port: int
+    dst_addr: str
+    dst_port: int
+    payload: bytes
 
 
 class TrafficCapturer:
@@ -30,6 +43,21 @@ class TrafficCapturer:
         self._handle: Optional[pydivert.WinDivert] = None
         self._capture_thread: Optional[threading.Thread] = None
         self._packet_callback: Optional[Callable] = None
+
+        # 抓包线程只负责 send+enqueue，不做重解析/上报，避免拖慢浏览器（reinjection 速度）。
+        self._packet_queue: "queue.Queue[Optional[_CapturedPacket]]" = queue.Queue(maxsize=2000)
+        self._worker_thread: Optional[threading.Thread] = None
+        self._dropped_packets = 0
+        self._last_drop_log_ts = 0.0
+
+        # 仅为“可能的 HTTP 响应方向”做轻量缓冲，避免只靠单包 payload 以 b"HTTP/" 开头来判断响应。
+        # key: f"{src_addr}:{src_port}->{dst_addr}:{dst_port}"（按抓包方向）
+        self._active_response_flows: dict[str, float] = {}  # flow_key -> first_seen_ts
+        self._response_buffers: dict[str, bytearray] = {}    # flow_key -> accumulated bytes
+        self._response_flow_logged: set[str] = set()
+        self._response_parse_fail_logged: set[str] = set()
+        self._response_flow_ttl_sec = 30
+        self._response_buffer_max_bytes = 256 * 1024
         
         if pydivert is None:
             raise ImportError("pydivert is required for traffic capture")
@@ -51,6 +79,13 @@ class TrafficCapturer:
             )
             
             self._running = True
+            self._worker_thread = threading.Thread(
+                target=self._worker_loop,
+                name="TrafficParseWorker",
+                daemon=True,
+            )
+            self._worker_thread.start()
+
             self._capture_thread = threading.Thread(
                 target=self._capture_loop,
                 name="TrafficCaptureThread",
@@ -80,8 +115,32 @@ class TrafficCapturer:
         
         if self._capture_thread and self._capture_thread.is_alive():
             self._capture_thread.join(timeout=2)
+
+        # 停止解析 worker
+        try:
+            self._packet_queue.put_nowait(None)
+        except Exception:
+            pass
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=2)
         
         logger.info("Traffic capture stopped")
+
+    def _worker_loop(self) -> None:
+        """解析/回调在独立线程执行（可能较慢，但不能阻塞抓包 reinject）"""
+        while True:
+            item = self._packet_queue.get()
+            try:
+                if item is None:
+                    return
+                self._process_packet(item)
+            except Exception as e:
+                logger.debug(f"Worker _process_packet error: {e}")
+            finally:
+                try:
+                    self._packet_queue.task_done()
+                except Exception:
+                    pass     
     
     def _capture_loop(self):
         """捕获循环 - 捕获并重新注入数据包，确保网络连通"""
@@ -126,10 +185,22 @@ class TrafficCapturer:
                         #     print(f"\n[PACKET #{packet_count}] {src} -> {dst}, payload: {payload_len} bytes")
                         #     print(f"[PREVIEW] {preview}")
                         
-                        # 在不影响传输的前提下进行解析和日志
-                        is_http = self._process_packet(packet)
-                        # if is_http:
-                        #     http_count += 1
+                        # 只入队，不在抓包线程里做重解析/回调
+                        captured = _CapturedPacket(
+                            src_addr=str(packet.src_addr),
+                            src_port=int(packet.src_port),
+                            dst_addr=str(packet.dst_addr),
+                            dst_port=int(packet.dst_port),
+                            payload=bytes(packet.payload) if packet.payload else b"",
+                        )
+                        try:
+                            self._packet_queue.put_nowait(captured)
+                        except queue.Full:
+                            self._dropped_packets += 1
+                            now = time.time()
+                            if now - self._last_drop_log_ts > 10:
+                                self._last_drop_log_ts = now
+                                logger.warning(f"Packet queue full, dropped={self._dropped_packets}")
                     except Exception as e:
                         print(f"[ERROR] Processing packet: {e}")
                         logger.debug(f"Error processing packet: {e}")
@@ -143,83 +214,24 @@ class TrafficCapturer:
         if not packet.payload:
             return False
         
-        # 尝试解析 HTTP 请求
-        payload = packet.payload
-        
-        # 检查是否是 HTTP 请求（简单检查）
-        http_methods = (b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"PATC")
-        is_http = any(payload.startswith(method) for method in http_methods)
-        is_http_response = payload.startswith(b"HTTP/")
-        
-        if not is_http and not is_http_response:
-            # 尝试解析 HTTPS/TLS ClientHello 的 SNI（域名）
-            tls_sni = self._parse_tls_sni(payload)
-            if tls_sni:
-                src_addr = packet.src_addr
-                src_port = packet.src_port
-                dst_addr = packet.dst_addr
-                dst_port = packet.dst_port
-                path = "/"
-                protocol = "https"
-                method = "CONNECT"
-                if self._packet_callback:
-                    self._packet_callback(
-                        src_addr=src_addr,
-                        src_port=src_port,
-                        dst_addr=dst_addr,
-                        dst_port=dst_port,
-                        payload=payload,
-                        http_info={
-                            "method": method,
-                            "protocol": protocol,
-                            "host": tls_sni,
-                            "path": path,
-                            "version": "TLS",
-                            "headers": "",
-                            "message_type": "request",
-                        },
-                        packet=packet
-                    )
-                return True
+        payload: bytes = packet.payload
 
-            # 不是 HTTP/HTTPS 请求，打印到 DEBUG 避免刷屏
-            if len(payload) > 0:
-                preview = payload[:100]
-                logger.debug(f"[NON-HTTP] {packet.src_addr}:{packet.src_port} -> {packet.dst_addr}:{packet.dst_port}")
-                logger.debug(f"[NON-HTTP] First 100 bytes: {preview}")
-
-            # 非 HTTP/HTTPS 请求，直接放行
-            return False
-        
-        # 提取源和目标信息
         src_addr = packet.src_addr
         src_port = packet.src_port
         dst_addr = packet.dst_addr
         dst_port = packet.dst_port
-        
-        # 解析 HTTP 请求基本信息
-        try:
-            http_info = self._parse_http_request(payload)
-            if http_info:
-                if self._packet_callback:
-                    self._packet_callback(
-                        src_addr=src_addr,
-                        src_port=src_port,
-                        dst_addr=dst_addr,
-                        dst_port=dst_port,
-                        payload=payload,
-                        http_info=http_info,
-                        packet=packet
-                    )
-                return True
-        except Exception as e:
-            logger.debug(f"Failed to parse HTTP request: {e}")
 
-        # 尝试解析 HTTP 响应
-        if is_http_response:
+        flow_key = self._build_flow_key(src_addr, src_port, dst_addr, dst_port)
+
+        # 1) 解析 HTTP 请求（客户端 -> 服务端方向）
+        # 仅在 payload 看起来像请求起始行时才尝试解析，保持开销可控
+        http_methods = (b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"PATC")
+        is_http_request_start = any(payload.startswith(method) for method in http_methods)
+        # 只在明确是请求起始行时解析请求
+        if is_http_request_start:
             try:
-                response_info = self._parse_http_response(payload)
-                if response_info:
+                http_info = self._parse_http_request(payload)
+                if http_info:
                     if self._packet_callback:
                         self._packet_callback(
                             src_addr=src_addr,
@@ -227,14 +239,128 @@ class TrafficCapturer:
                             dst_addr=dst_addr,
                             dst_port=dst_port,
                             payload=payload,
+                            http_info=http_info,
+                            packet=packet
+                        )
+                    # 请求解析成功后，标记“响应方向”以便后续缓存并解析 HTTP 响应
+                    response_flow_key = self._build_flow_key(dst_addr, dst_port, src_addr, src_port)
+                    self._active_response_flows[response_flow_key] = time.time()
+                    self._response_buffers.pop(response_flow_key, None)  # 新请求从新开始累积
+                    self._response_flow_logged.discard(response_flow_key)
+                    self._response_parse_fail_logged.discard(response_flow_key)
+                    return True
+            except Exception as e:
+                logger.debug(f"Failed to parse HTTP request: {e}")
+
+        # 2) 尝试解析 HTTP 响应（服务端 -> 客户端方向）
+        if flow_key in self._active_response_flows:
+            self._cleanup_expired_response_flows()
+
+            buf = self._response_buffers.setdefault(flow_key, bytearray())
+            buf.extend(payload)
+
+            if len(buf) > self._response_buffer_max_bytes:
+                # 防止异常大包/未命中导致内存膨胀
+                self._response_buffers.pop(flow_key, None)
+                self._active_response_flows.pop(flow_key, None)
+                self._response_flow_logged.discard(flow_key)
+                self._response_parse_fail_logged.discard(flow_key)
+                return False
+
+            try:
+                # 首次进入该响应方向缓存
+                if flow_key not in self._response_flow_logged:
+                    self._response_flow_logged.add(flow_key)
+
+                response_info = self._parse_http_response(bytes(buf))
+
+                if response_info:
+                    # 给 proxy_handler 的 payload 尽量从 HTTP 状态行开始，避免它用第一次 "\r\n\r\n" 截断时解析错位
+                    buf_bytes = bytes(buf)
+                    http_start = buf_bytes.find(b"HTTP/")
+                    payload_for_callback = buf_bytes[http_start:] if http_start != -1 else buf_bytes
+                    if self._packet_callback:
+                        self._packet_callback(
+                            src_addr=src_addr,
+                            src_port=src_port,
+                            dst_addr=dst_addr,
+                            dst_port=dst_port,
+                            payload=payload_for_callback,
                             http_info=response_info,
                             packet=packet
                         )
+                    # 响应解析完成：清理该方向缓存
+                    self._response_buffers.pop(flow_key, None)
+                    self._active_response_flows.pop(flow_key, None)
+                    self._response_flow_logged.discard(flow_key)
+                    self._response_parse_fail_logged.discard(flow_key)
                     return True
+
+                # response_info 为 None：只在每个 flowKey 第一次失败时打印失败原因
+                if flow_key not in self._response_parse_fail_logged:
+                    self._response_parse_fail_logged.add(flow_key)
+                    buf_bytes = bytes(buf)
+                    http_start = buf_bytes.find(b"HTTP/")
+                    header_end = buf_bytes.find(b"\r\n\r\n", http_start if http_start != -1 else 0)
+                    preview = buf_bytes[:120]
+                    logger.info(
+                        "response_parse_fail="
+                        f" flow_key={flow_key} http_start={http_start} header_end={header_end} "
+                        f"preview={preview!r}"
+                    )
             except Exception as e:
                 logger.debug(f"Failed to parse HTTP response: {e}")
-        
+
+            return False
+
+        # 3) 不是请求、且也不是我们正在跟踪的响应方向：尝试解析 HTTPS/TLS ClientHello 的 SNI（域名）
+        tls_sni = self._parse_tls_sni(payload)
+        if tls_sni:
+            path = "/"
+            protocol = "https"
+            method = "CONNECT"
+            if self._packet_callback:
+                self._packet_callback(
+                    src_addr=src_addr,
+                    src_port=src_port,
+                    dst_addr=dst_addr,
+                    dst_port=dst_port,
+                    payload=payload,
+                    http_info={
+                        "method": method,
+                        "protocol": protocol,
+                        "host": tls_sni,
+                        "path": path,
+                        "version": "TLS",
+                        "headers": "",
+                        "message_type": "request",
+                    },
+                    packet=packet
+                )
+            return True
+
+        # 不是 HTTP/HTTPS 请求，打印到 DEBUG 避免刷屏
+        if len(payload) > 0:
+            preview = payload[:100]
+            logger.debug(f"[NON-HTTP] {packet.src_addr}:{packet.src_port} -> {packet.dst_addr}:{packet.dst_port}")
+            logger.debug(f"[NON-HTTP] First 100 bytes: {preview}")
+
         return False
+
+    @staticmethod
+    def _build_flow_key(src_addr: str, src_port: int, dst_addr: str, dst_port: int) -> str:
+        return f"{src_addr}:{src_port}->{dst_addr}:{dst_port}"
+
+    def _cleanup_expired_response_flows(self) -> None:
+        if not self._active_response_flows:
+            return
+        now = time.time()
+        expired = [k for k, ts in self._active_response_flows.items() if (now - ts) > self._response_flow_ttl_sec]
+        for k in expired:
+            self._active_response_flows.pop(k, None)
+            self._response_buffers.pop(k, None)
+            self._response_flow_logged.discard(k)
+            self._response_parse_fail_logged.discard(k)
     
     def _parse_http_request(self, payload: bytes) -> Optional[dict]:
         """
@@ -295,11 +421,15 @@ class TrafficCapturer:
     def _parse_http_response(self, payload: bytes) -> Optional[dict]:
         """简单解析 HTTP 响应"""
         try:
-            header_end = payload.find(b"\r\n\r\n")
+            # 响应状态行不一定从 packet payload 第 0 字节开始：这里允许在缓冲里搜索 "HTTP/" 起始位置
+            http_start = payload.find(b"HTTP/")
+            if http_start == -1:
+                return None
+            header_end = payload.find(b"\r\n\r\n", http_start)
             if header_end == -1:
                 return None
 
-            headers_bytes = payload[:header_end]
+            headers_bytes = payload[http_start:header_end]
             body = payload[header_end + 4:]
             headers_data = headers_bytes.decode("utf-8", errors="ignore")
             lines = headers_data.split("\r\n")
