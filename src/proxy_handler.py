@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urlparse
 
@@ -50,6 +51,7 @@ class TransparentProxyHandler:
             method, protocol, host, dst_port, path_for_rule
         )
 
+        # 用于日志可读；同时也会构建 request_data 里需要的真正 URL（不带 method）
         url = self._format_request_url(method, protocol, host, dst_port, path)
         # 避免对每个 HTTP 包都写日志导致抓包线程被 I/O 拖慢
         # logger.info(f"[地址] {url}")
@@ -70,15 +72,35 @@ class TransparentProxyHandler:
         request_query = self._extract_query_params(path)
         request_body_params = self._extract_body_params(request_headers, request_body_text)
 
+        # 组装给 API2 的 request_data（用于唯一追踪一次请求的上下文）
+        default_port = 80 if protocol == "http" else 443
+        if dst_port and dst_port != default_port:
+            url_only = f"{protocol}://{host}:{dst_port}{path}"
+        else:
+            url_only = f"{protocol}://{host}{path}"
+
+        request_data = {
+            "method": method,
+            "url": url_only,
+            "headers": request_headers,
+            "body": request_body_params,
+            "query_params": request_query,
+            "path_params": {},
+        }
+
         # logger.info(f"request_headers={request_headers}")
         # logger.info(f"request_body_text={request_body_text}")
         # logger.info(f"request_query={request_query}")
         # logger.info(f"request_body_params={request_body_params}")
 
+        # 当前请求唯一标识，用于与后续响应配对，并随同上报发送给 API2
+        tracking_id = uuid.uuid4().hex
+
         flow_key = self._build_flow_key(src_addr, src_port, dst_addr, dst_port)
         with self._pending_lock:
             self._pending_requests[flow_key] = {
                 "rule": rule,
+                "tracking_id": tracking_id,
                 "request": {
                     "line": {
                         "method": method,
@@ -96,6 +118,7 @@ class TransparentProxyHandler:
                     "payload_size": len(payload),
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 },
+                "request_data": request_data,
             }
         return True
 
@@ -110,30 +133,37 @@ class TransparentProxyHandler:
 
         rule: CaptureRule = pending["rule"]
         request_obj = pending["request"]
+        tracking_id = pending.get("tracking_id")
+        request_data = pending.get("request_data", request_obj)
 
         response_headers_raw, response_body_bytes = self._split_http_payload(payload)
         response_headers = self._headers_text_to_dict(response_headers_raw or http_info.get("headers", ""))
         response_body_text = self._decode_body(response_body_bytes if response_body_bytes else http_info.get("body", b""))
 
-        response_obj = {
-            "line": {
-                "version": http_info.get("version", "HTTP/1.1"),
-                "status_code": http_info.get("status_code", 0),
-                "reason": http_info.get("reason", ""),
-            },
-            "headers": response_headers,
-            "body": response_body_text,
-            "payload_size": len(payload),
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
 
-        capture_json = {
-            "api_id": rule.api_id,
-            "api_name": rule.api_name,
-            "network": {
-                "request": request_obj,
-                "response": response_obj,
-            }
+        # aaa = http_info.get("body", b"")
+        # logger.info("1111111111111111")
+        # logger.info(f"response_body_bytes={response_body_bytes}")
+        # logger.info(f"response_body_text={response_body_text}")
+        # logger.info(f"aaa={aaa}")
+
+        # 组装给 API2 的 response_data（按你要求的顶层结构）
+        content_type = response_headers.get("Content-Type", "").lower()
+        # 按你要求 response_data.body 必须是“对象”。
+        # - 若能解析出 JSON：用解析结果
+        # - 否则：放入 {"raw": "..."}，避免上传字段类型不一致
+        # 按你的要求：非 JSON 响应 body 直接置空（空对象）
+        response_body_parsed = {}
+        if "application/json" in content_type:
+            try:
+                response_body_parsed = json.loads(response_body_text) if response_body_text else {}
+            except Exception:
+                response_body_parsed = {}
+
+        response_data = {
+            "status_code": http_info.get("status_code", 0),
+            "headers": response_headers,
+            "body": response_body_parsed,
         }
 
         req_line = request_obj["line"]
@@ -143,9 +173,9 @@ class TransparentProxyHandler:
             try:
                 success = self.api_client.upload_capture_data(
                     rule.api_id,
-                    request_data=request_obj,
-                    response_data=response_obj,
-                    capture_data=capture_json,
+                    request_data=request_data,
+                    response_data=response_data,
+                    tracking_id=tracking_id,
                 )
                 upload_status = "SUCCESS" if success else "FAILED"
             except Exception as e:

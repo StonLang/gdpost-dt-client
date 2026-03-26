@@ -135,6 +135,7 @@ class APIClient:
             response = self.session.get(
                 self.config.api_configs_url,
                 headers=headers,
+                timeout=(self.config.connect_timeout, self.config.read_timeout),
             )
             
             if response.status_code == 200:
@@ -160,14 +161,21 @@ class APIClient:
             logger.error(f"Error fetching capture rules: {e}")
             return False
     
-    def upload_capture_data(self, api_id: int, request_data: Dict, response_data: Dict, capture_data: Optional[Dict] = None) -> bool:
+    def upload_capture_data(
+        self,
+        api_id: int,
+        request_data: Dict,
+        response_data: Dict,
+        tracking_id: Optional[str] = None,
+    ) -> bool:
         """
         将捕获的数据上报到API接口2
         
         Args:
             api_id: 匹配的API ID
-            request_data: 请求数据
-            response_data: 响应数据
+            request_data: 请求数据（目标格式：request_data）
+            response_data: 响应数据（目标格式：response_data）
+            tracking_id: 当前请求唯一追踪ID
             
         Returns:
             bool: 是否成功上报
@@ -185,13 +193,10 @@ class APIClient:
             
             payload = {
                 "api_id": api_id,
-                "client_id": self.config.client_id,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "request": request_data,
-                "response": response_data,
+                "tracking_id": tracking_id,
+                "request_data": request_data,
+                "response_data": response_data,
             }
-            if capture_data is not None:
-                payload["capture_data"] = capture_data
             
 
             
@@ -201,6 +206,7 @@ class APIClient:
                 self.config.api_upload_url,
                 headers=headers,
                 json=payload,
+                timeout=(self.config.connect_timeout, self.config.read_timeout),
             )
             
             if response.status_code == 200:

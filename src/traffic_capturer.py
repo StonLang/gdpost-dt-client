@@ -185,22 +185,54 @@ class TrafficCapturer:
                         #     print(f"\n[PACKET #{packet_count}] {src} -> {dst}, payload: {payload_len} bytes")
                         #     print(f"[PREVIEW] {preview}")
                         
-                        # 只入队，不在抓包线程里做重解析/回调
-                        captured = _CapturedPacket(
-                            src_addr=str(packet.src_addr),
-                            src_port=int(packet.src_port),
-                            dst_addr=str(packet.dst_addr),
-                            dst_port=int(packet.dst_port),
-                            payload=bytes(packet.payload) if packet.payload else b"",
-                        )
-                        try:
-                            self._packet_queue.put_nowait(captured)
-                        except queue.Full:
-                            self._dropped_packets += 1
-                            now = time.time()
-                            if now - self._last_drop_log_ts > 10:
-                                self._last_drop_log_ts = now
-                                logger.warning(f"Packet queue full, dropped={self._dropped_packets}")
+                        # 只对“看起来像 HTTP/TLS”的包入队，避免把所有 TCP 都解析到 worker
+                        payload = packet.payload
+                        if payload:
+                            # 如果该连接的“响应方向”已被激活，则不做额外过滤，直接入队用于拼接响应
+                            current_flow_key = f"{packet.src_addr}:{int(packet.src_port)}->{packet.dst_addr}:{int(packet.dst_port)}"
+                            if current_flow_key in self._active_response_flows:
+                                captured = _CapturedPacket(
+                                    src_addr=str(packet.src_addr),
+                                    src_port=int(packet.src_port),
+                                    dst_addr=str(packet.dst_addr),
+                                    dst_port=int(packet.dst_port),
+                                    payload=bytes(payload),
+                                )
+                                try:
+                                    self._packet_queue.put_nowait(captured)
+                                except queue.Full:
+                                    self._dropped_packets += 1
+                                    now = time.time()
+                                    if now - self._last_drop_log_ts > 10:
+                                        self._last_drop_log_ts = now
+                                        logger.warning(f"Packet queue full, dropped={self._dropped_packets}")
+                                # 该包已处理完
+                                continue
+
+                            http_methods = (
+                                b"GET ", b"POST", b"PUT ", b"DELE", b"HEAD", b"OPTI", b"PATC"
+                            )
+                            # HTTP/ 可能不在包起始处（分片），这里允许在前几十字节内出现
+                            http_off = payload.find(b"HTTP/")
+                            looks_http = any(payload.startswith(m) for m in http_methods) or (http_off != -1 and http_off < 64)
+                            # TLS ClientHello 记录通常第 0 字节为 0x16（handshake）
+                            looks_tls = len(payload) > 5 and payload[0] == 0x16
+                            if looks_http or looks_tls:
+                                captured = _CapturedPacket(
+                                    src_addr=str(packet.src_addr),
+                                    src_port=int(packet.src_port),
+                                    dst_addr=str(packet.dst_addr),
+                                    dst_port=int(packet.dst_port),
+                                    payload=bytes(payload),
+                                )
+                                try:
+                                    self._packet_queue.put_nowait(captured)
+                                except queue.Full:
+                                    self._dropped_packets += 1
+                                    now = time.time()
+                                    if now - self._last_drop_log_ts > 10:
+                                        self._last_drop_log_ts = now
+                                        logger.warning(f"Packet queue full, dropped={self._dropped_packets}")
                     except Exception as e:
                         print(f"[ERROR] Processing packet: {e}")
                         logger.debug(f"Error processing packet: {e}")
