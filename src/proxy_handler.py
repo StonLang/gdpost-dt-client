@@ -35,13 +35,10 @@ class TransparentProxyHandler:
         """
         message_type = http_info.get("message_type", "request")
         if message_type == "response":
-            logger.info(f"222222222222222222")
             return self._handle_http_response(src_addr, src_port, dst_addr, dst_port, payload, http_info)
-        logger.info(f"1111111111111")
         return self._handle_http_request(src_addr, src_port, dst_addr, dst_port, payload, http_info)
 
-    def _handle_http_request(self, src_addr: str, src_port: int, dst_addr: str, dst_port: int,
-                             payload: bytes, http_info: dict) -> bool:
+    def _handle_http_request(self, src_addr: str, src_port: int, dst_addr: str, dst_port: int, payload: bytes, http_info: dict) -> bool:
         method = http_info.get("method", "GET")
         protocol = (http_info.get("protocol", "http") or "http").lower()
         host = self._normalize_host(http_info.get("host") or str(dst_addr))
@@ -102,8 +99,7 @@ class TransparentProxyHandler:
             }
         return True
 
-    def _handle_http_response(self, src_addr: str, src_port: int, dst_addr: str, dst_port: int,
-                              payload: bytes, http_info: dict) -> bool:
+    def _handle_http_response(self, src_addr: str, src_port: int, dst_addr: str, dst_port: int, payload: bytes, http_info: dict) -> bool:
         # 响应方向的连接键与请求方向相反
         flow_key = self._build_flow_key(dst_addr, dst_port, src_addr, src_port)
         with self._pending_lock:
@@ -118,19 +114,6 @@ class TransparentProxyHandler:
         response_headers_raw, response_body_bytes = self._split_http_payload(payload)
         response_headers = self._headers_text_to_dict(response_headers_raw or http_info.get("headers", ""))
         response_body_text = self._decode_body(response_body_bytes if response_body_bytes else http_info.get("body", b""))
-
-        # 限制上传体积 + 降低日志体积
-        max_body_for_upload = 200 * 1024  # 200KB
-        if len(response_body_text) > max_body_for_upload:
-            response_body_text = response_body_text[:max_body_for_upload] + "...[truncated]"
-        response_body_preview_max = 2000
-        response_body_preview = response_body_text
-        if len(response_body_preview) > response_body_preview_max:
-            response_body_preview = response_body_preview[:response_body_preview_max] + "...[truncated]"
-
-        # 响应体可能很大，降噪避免拖慢解析线程（抓包已解耦，但仍建议少写日志）
-        logger.debug(f"response_headers_keys={list(response_headers.keys())}")
-        logger.debug(f"response_body_preview={response_body_preview}")
 
         response_obj = {
             "line": {
