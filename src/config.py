@@ -34,7 +34,8 @@ class ClientConfig:
     log_retention_days: int = field(default=30)
     
     # WinDivert：默认捕获全部 TCP（任意源/目的 IP、任意端口、入站+出站），便于关联请求与响应
-    divert_filter: str = field(default="tcp")
+    # 排除本机回环地址流量，避免抓取本地服务调用
+    divert_filter: str = field(default="tcp and not (ip.DstAddr == 127.0.0.1 or ip.SrcAddr == 127.0.0.1)")
     divert_priority: int = field(default=0)
     
     # 代理配置（本地透明代理端口）
@@ -58,7 +59,7 @@ class ClientConfig:
             log_dir=os.getenv("LOG_DIR", "logs"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             log_retention_days=int(os.getenv("LOG_RETENTION_DAYS", "30")),
-            divert_filter=os.getenv("DIVERT_FILTER", "tcp"),
+            divert_filter=os.getenv("DIVERT_FILTER", "tcp and not (ip.DstAddr == 127.0.0.1 or ip.SrcAddr == 127.0.0.1)"),
             divert_priority=int(os.getenv("DIVERT_PRIORITY", "0")),
             proxy_host=os.getenv("PROXY_HOST", "127.0.0.1"),
             proxy_port=int(os.getenv("PROXY_PORT", "0")),
