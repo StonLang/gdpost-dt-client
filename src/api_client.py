@@ -106,8 +106,14 @@ class APIClient:
     def __init__(self, config: ClientConfig):
         self.config = config
         self.session = requests.Session()
-        self.session.timeout = (config.connect_timeout, config.read_timeout)
+        self.session.timeout = (config.connect_timeout, self.config.read_timeout)
         self.session.verify = False
+        
+        # 禁用连接池，确保每次请求后关闭连接
+        adapter = requests.adapters.HTTPAdapter(pool_maxsize=1, pool_block=False)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
         self._rules: List[CaptureRule] = []
         self._last_refresh: float = 0
     
@@ -180,16 +186,24 @@ class APIClient:
         Returns:
             bool: 是否成功上报
         """
+        response = None
         try:
             headers = {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
+                "Connection": "close",  # 确保请求完成后关闭连接
             }
             
             if self.config.api_key:
                 headers["X-API-Key"] = self.config.api_key
             if self.config.client_id:
                 headers["X-Client-ID"] = self.config.client_id
+            
+            # 确保 tracking_id 不为空
+            if tracking_id is None:
+                import uuid
+                tracking_id = uuid.uuid4().hex
+                logger.warning(f"tracking_id was None, generated new: {tracking_id}")
             
             payload = {
                 "api_id": api_id,
@@ -198,10 +212,10 @@ class APIClient:
                 "response_data": response_data,
             }
             
-
+            logger.info(f"Upload payload: api_id={api_id}, tracking_id={tracking_id}")
+            logger.debug(f"Full payload: {payload}")
+            logger.info(f"Starting upload to {self.config.api_upload_url} for api_id={api_id}")
             
-            logger.debug(f"payload={payload}")
-
             response = self.session.post(
                 self.config.api_upload_url,
                 headers=headers,
@@ -210,7 +224,7 @@ class APIClient:
             )
             
             if response.status_code == 200:
-                logger.debug(f"Successfully uploaded capture data for api_id={api_id}")
+                logger.info(f"Successfully uploaded capture data for api_id={api_id}")
                 return True
             else:
                 logger.warning(f"Failed to upload data: HTTP {response.status_code}")
@@ -219,6 +233,13 @@ class APIClient:
         except Exception as e:
             logger.error(f"Error uploading capture data: {e}")
             return False
+        finally:
+            # 确保响应连接关闭
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
     
     def find_matching_rule(self, method: str, protocol: str, host: str, port: int, path: str) -> Optional[CaptureRule]:
         """

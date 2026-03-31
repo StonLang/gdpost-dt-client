@@ -24,8 +24,8 @@ class TransparentProxyHandler:
         self.api_client = api_client
         self._pending_requests = {}
         self._pending_lock = threading.Lock()
-        # 上传放到单线程 executor，避免阻塞解析线程/抓包线程
-        self._upload_executor = ThreadPoolExecutor(max_workers=1)
+        # 上传放到多线程 executor，避免阻塞解析线程/抓包线程
+        self._upload_executor = ThreadPoolExecutor(max_workers=5)
 
     def handle_request(self, src_addr: str, src_port: int, dst_addr: str, dst_port: int,
                        payload: bytes, http_info: dict, packet: object) -> bool:
@@ -171,6 +171,7 @@ class TransparentProxyHandler:
         def _upload_task():
             upload_status = "FAILED"
             try:
+                logger.info(f"Starting upload for api_id={rule.api_id}, tracking_id={tracking_id}")
                 success = self.api_client.upload_capture_data(
                     rule.api_id,
                     request_data=request_data,
@@ -178,8 +179,9 @@ class TransparentProxyHandler:
                     tracking_id=tracking_id,
                 )
                 upload_status = "SUCCESS" if success else "FAILED"
+                logger.info(f"Upload completed for api_id={rule.api_id}, status={upload_status}")
             except Exception as e:
-                logger.error(f"Upload failed: {e}")
+                logger.error(f"Upload failed for api_id={rule.api_id}: {e}")
             log_matched_request(
                 req_line["method"],
                 req_line["protocol"],
@@ -190,6 +192,7 @@ class TransparentProxyHandler:
                 upload_status,
             )
 
+        # 立即提交上传任务，使用线程池执行
         self._upload_executor.submit(_upload_task)
         return True
 
