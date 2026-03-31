@@ -212,9 +212,7 @@ class APIClient:
                 "response_data": response_data,
             }
             
-            logger.info(f"Upload payload: api_id={api_id}, tracking_id={tracking_id}")
-            logger.debug(f"Full payload: {payload}")
-            logger.info(f"Starting upload to {self.config.api_upload_url} for api_id={api_id}")
+            logger.info(f"Starting upload for api_id={api_id}, tracking_id={tracking_id}")
             
             response = self.session.post(
                 self.config.api_upload_url,
