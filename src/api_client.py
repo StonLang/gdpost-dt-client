@@ -2,13 +2,13 @@
 API客户端模块 - 负责与服务端通信
 """
 import json
+import http.client
 import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
-import requests
 import urllib3
 
 from .config import ClientConfig
@@ -105,17 +105,34 @@ class APIClient:
     
     def __init__(self, config: ClientConfig):
         self.config = config
-        self.session = requests.Session()
-        self.session.timeout = (config.connect_timeout, self.config.read_timeout)
-        self.session.verify = False
-        
-        # 禁用连接池，确保每次请求后关闭连接
-        adapter = requests.adapters.HTTPAdapter(pool_maxsize=1, pool_block=False)
-        self.session.mount('http://', adapter)
-        self.session.mount('https://', adapter)
-        
         self._rules: List[CaptureRule] = []
         self._last_refresh: float = 0
+    
+    def _http_post(self, url: str, data: Dict, headers: Dict) -> tuple:
+        """使用 http.client 发送 POST 请求"""
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        headers["Content-Length"] = str(len(body))
+        
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(host, port, timeout=self.config.read_timeout)
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=self.config.read_timeout)
+        
+        try:
+            conn.request("POST", path, body=body, headers=headers)
+            response = conn.getresponse()
+            status = response.status
+            response_body = response.read().decode("utf-8")
+            return status, response_body
+        finally:
+            conn.close()
     
     def fetch_capture_rules(self) -> bool:
         """
@@ -138,14 +155,24 @@ class APIClient:
             
             logger.info(f"Fetching capture rules from: {self.config.api_configs_url}")
             
-            response = self.session.get(
-                self.config.api_configs_url,
-                headers=headers,
-                timeout=(self.config.connect_timeout, self.config.read_timeout),
-            )
+            parsed = urlparse(self.config.api_configs_url)
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            path = parsed.path or "/"
             
-            if response.status_code == 200:
-                data = response.json()
+            if parsed.scheme == "https":
+                conn = http.client.HTTPSConnection(host, port, timeout=self.config.read_timeout)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=self.config.read_timeout)
+            
+            conn.request("GET", path, headers=headers)
+            response = conn.getresponse()
+            status = response.status
+            body = response.read().decode("utf-8")
+            conn.close()
+            
+            if status == 200:
+                data = json.loads(body)
                 
                 if data.get("success") and "data" in data:
                     rules_data = data["data"]
@@ -157,12 +184,9 @@ class APIClient:
                     logger.warning(f"API returned unsuccessful response: {data.get('message')}")
                     return False
             else:
-                logger.error(f"Failed to fetch rules: HTTP {response.status_code} - {response.text}")
+                logger.error(f"Failed to fetch rules: HTTP {status}")
                 return False
                 
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Connection error: {e}")
-            return False
         except Exception as e:
             logger.error(f"Error fetching capture rules: {e}")
             return False
@@ -191,7 +215,6 @@ class APIClient:
             headers = {
                 "Accept": "application/json",
                 "Content-Type": "application/json",
-                "Connection": "close",  # 确保请求完成后关闭连接
             }
             
             if self.config.api_key:
@@ -213,31 +236,24 @@ class APIClient:
             }
             
             logger.info(f"Starting upload for api_id={api_id}, tracking_id={tracking_id}")
+            logger.info(f"Upload URL: {self.config.api_upload_url}")
             
-            response = self.session.post(
+            status, response_body = self._http_post(
                 self.config.api_upload_url,
-                headers=headers,
-                json=payload,
-                timeout=(self.config.connect_timeout, self.config.read_timeout),
+                payload,
+                headers
             )
             
-            if response.status_code == 200:
+            if status == 200:
                 logger.info(f"Successfully uploaded capture data for api_id={api_id}")
                 return True
             else:
-                logger.warning(f"Failed to upload data: HTTP {response.status_code}")
+                logger.warning(f"Failed to upload data: HTTP {status}, body: {response_body[:200]}")
                 return False
                 
         except Exception as e:
             logger.error(f"Error uploading capture data: {e}")
             return False
-        finally:
-            # 确保响应连接关闭
-            if response is not None:
-                try:
-                    response.close()
-                except Exception:
-                    pass
     
     def find_matching_rule(self, method: str, protocol: str, host: str, port: int, path: str) -> Optional[CaptureRule]:
         """

@@ -18,6 +18,11 @@ def main():
     # 加载配置
     config = ClientConfig.from_env()
     
+    # 强制覆盖配置：避免 WinDivert 干扰本地连接
+    config.api_base_url = "http://127.0.0.1:8000"
+    # 使用 IP 地址检查排除本地回环 (WinDivert 不支持 loopback 关键字)
+    config.divert_filter = "tcp and ip.DstAddr != 127.0.0.1 and ip.SrcAddr != 127.0.0.1"
+    
     # 设置日志
     setup_logging(config.log_dir, config.log_level, config.log_retention_days)
     
@@ -26,6 +31,8 @@ def main():
     
     logger.info("=" * 60)
     logger.info("gdpost-dt-client 正在启动...")
+    logger.info(f"API URL: {config.api_base_url}")
+    logger.info(f"WinDivert Filter: {config.divert_filter}")
     logger.info("=" * 60)
     
     # 创建API客户端

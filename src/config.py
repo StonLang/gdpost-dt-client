@@ -15,7 +15,8 @@ class ClientConfig:
     """客户端配置"""
     
     # 服务端API接口1配置（获取捕获规则）
-    api_base_url: str = field(default="http://localhost:8000")
+    # 使用 127.0.0.1 避免 localhost 解析问题，或配置为局域网地址
+    api_base_url: str = field(default="http://127.0.0.1:8000")
     api_configs_endpoint: str = field(default="/api/v1/api-configs/login")
     
     # 服务端API接口2配置（上报捕获数据）
@@ -33,9 +34,9 @@ class ClientConfig:
     log_level: str = field(default="INFO")
     log_retention_days: int = field(default=30)
     
-    # WinDivert：默认捕获全部 TCP（任意源/目的 IP、任意端口、入站+出站），便于关联请求与响应
-    # 排除本机回环地址流量，避免抓取本地服务调用
-    divert_filter: str = field(default="tcp and not (ip.DstAddr == 127.0.0.1 or ip.SrcAddr == 127.0.0.1)")
+    # WinDivert：捕获全部 TCP 但排除本地回环流量
+    # 使用 IP 地址检查排除 127.0.0.1 (WinDivert 不支持 loopback 关键字)
+    divert_filter: str = field(default="tcp and ip.DstAddr != 127.0.0.1 and ip.SrcAddr != 127.0.0.1")
     divert_priority: int = field(default=0)
     
     # 代理配置（本地透明代理端口）
@@ -50,7 +51,7 @@ class ClientConfig:
     def from_env(cls) -> "ClientConfig":
         """从环境变量加载配置"""
         return cls(
-            api_base_url=os.getenv("API_BASE_URL", "http://localhost:8000"),
+            api_base_url=os.getenv("API_BASE_URL", "http://127.0.0.1:8000"),
             api_configs_endpoint=os.getenv("API_CONFIGS_ENDPOINT", "/api/v1/api-configs/login"),
             api_upload_endpoint=os.getenv("API_UPLOAD_ENDPOINT", "/api/v1/capture/upload"),
             api_key=os.getenv("API_KEY"),
@@ -59,7 +60,7 @@ class ClientConfig:
             log_dir=os.getenv("LOG_DIR", "logs"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             log_retention_days=int(os.getenv("LOG_RETENTION_DAYS", "30")),
-            divert_filter=os.getenv("DIVERT_FILTER", "tcp and not (ip.DstAddr == 127.0.0.1 or ip.SrcAddr == 127.0.0.1)"),
+            divert_filter=os.getenv("DIVERT_FILTER", "tcp and ip.DstAddr != 127.0.0.1 and ip.SrcAddr != 127.0.0.1"),
             divert_priority=int(os.getenv("DIVERT_PRIORITY", "0")),
             proxy_host=os.getenv("PROXY_HOST", "127.0.0.1"),
             proxy_port=int(os.getenv("PROXY_PORT", "0")),
