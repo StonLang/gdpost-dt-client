@@ -71,10 +71,12 @@ def main():
     def refresh_loop():
         # 重试间隔（秒）- 获取失败时使用
         retry_interval = 30
+        # 记录上次是否成功获取规则
+        last_fetch_success = True  # 初始假设成功，第一次使用轮询间隔
         
         while not stop_event.is_set():
             # 根据上次获取结果决定等待时间
-            wait_time = config.poll_interval if api_client._last_refresh > 0 else retry_interval
+            wait_time = config.poll_interval if last_fetch_success else retry_interval
             
             # 分段等待，便于及时响应停止事件
             elapsed = 0
@@ -86,7 +88,8 @@ def main():
                 break
                 
             logger.info("正在刷新捕获规则...")
-            if api_client.fetch_capture_rules():
+            last_fetch_success = api_client.fetch_capture_rules()
+            if last_fetch_success:
                 logger.info(f"规则已刷新，当前共 {len(api_client.rules)} 条")
             else:
                 logger.warning(f"规则获取失败，将在 {retry_interval} 秒后重试")

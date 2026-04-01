@@ -128,11 +128,18 @@ class TrafficCapturer:
 
     def _worker_loop(self) -> None:
         """解析/回调在独立线程执行（可能较慢，但不能阻塞抓包 reinject）"""
+        packet_count = 0
         while True:
             item = self._packet_queue.get()
             try:
                 if item is None:
                     return
+                
+                # 定期让出 GIL，避免阻塞其他线程
+                packet_count += 1
+                if packet_count % 50 == 0:
+                    time.sleep(0.001)  # 1ms 让出 GIL
+                
                 self._process_packet(item)
             except Exception as e:
                 logger.debug(f"Worker _process_packet error: {e}")
@@ -155,6 +162,12 @@ class TrafficCapturer:
                 for packet in self._handle:
                     if not self._running:
                         break
+                    
+                    # 定期让出 GIL，避免阻塞其他 Python 线程（如 refresh_loop）
+                    # 每处理 100 个包后主动释放控制权
+                    if (packet_count := getattr(self, '_packet_count', 0)) % 100 == 0:
+                        time.sleep(0.001)  # 1ms 让出 GIL
+                    self._packet_count = packet_count + 1
                     
                     # packet_count += 1
                     
