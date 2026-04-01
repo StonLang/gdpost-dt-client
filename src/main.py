@@ -69,13 +69,27 @@ def main():
     stop_event = threading.Event()
     
     def refresh_loop():
+        # 重试间隔（秒）- 获取失败时使用
+        retry_interval = 30
+        
         while not stop_event.is_set():
-            time.sleep(config.poll_interval)
+            # 根据上次获取结果决定等待时间
+            wait_time = config.poll_interval if api_client._last_refresh > 0 else retry_interval
+            
+            # 分段等待，便于及时响应停止事件
+            elapsed = 0
+            while elapsed < wait_time and not stop_event.is_set():
+                time.sleep(1)
+                elapsed += 1
+            
             if stop_event.is_set():
                 break
+                
             logger.info("正在刷新捕获规则...")
             if api_client.fetch_capture_rules():
                 logger.info(f"规则已刷新，当前共 {len(api_client.rules)} 条")
+            else:
+                logger.warning(f"规则获取失败，将在 {retry_interval} 秒后重试")
     
     refresh_thread = threading.Thread(target=refresh_loop, name="RuleRefreshThread", daemon=True)
     refresh_thread.start()

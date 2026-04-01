@@ -4,9 +4,10 @@ API客户端模块 - 负责与服务端通信
 import json
 import http.client
 import logging
+import socket
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import urllib3
@@ -17,6 +18,9 @@ from .config import ClientConfig
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger(__name__)
+
+# 默认 socket 超时（连接超时，读取超时）
+DEFAULT_SOCKET_TIMEOUT = (5, 30)  # (连接超时5秒，读取超时30秒)
 
 
 @dataclass
@@ -107,9 +111,36 @@ class APIClient:
         self.config = config
         self._rules: List[CaptureRule] = []
         self._last_refresh: float = 0
+        self._max_retries = 3  # 最大重试次数
+        self._backoff_base = 2  # 指数退避基数（秒）
     
-    def _http_post(self, url: str, data: Dict, headers: Dict) -> tuple:
-        """使用 http.client 发送 POST 请求"""
+    def _make_request(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        body: Optional[bytes] = None,
+        timeout: Optional[Tuple[float, float]] = None
+    ) -> Tuple[int, str]:
+        """
+        发送 HTTP 请求，带重试机制
+        
+        Args:
+            method: HTTP 方法 (GET, POST 等)
+            url: 请求 URL
+            headers: 请求头
+            body: 请求体（可选）
+            timeout: (连接超时, 读取超时) 元组，默认 (5, 30)
+            
+        Returns:
+            (status_code, response_body)
+            
+        Raises:
+            Exception: 当所有重试都失败时
+        """
+        if timeout is None:
+            timeout = DEFAULT_SOCKET_TIMEOUT
+        
         parsed = urlparse(url)
         host = parsed.hostname
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -117,59 +148,100 @@ class APIClient:
         if parsed.query:
             path += "?" + parsed.query
         
+        last_exception = None
+        
+        for attempt in range(self._max_retries):
+            conn = None
+            try:
+                # 创建连接，设置超时
+                if parsed.scheme == "https":
+                    conn = http.client.HTTPSConnection(
+                        host, port, timeout=timeout[1]
+                    )
+                else:
+                    conn = http.client.HTTPConnection(
+                        host, port, timeout=timeout[1]
+                    )
+                
+                # 设置 socket 连接超时（单独设置，防止连接阶段挂起）
+                conn.timeout = timeout[0]
+                
+                # 发送请求
+                if body:
+                    conn.request(method, path, body=body, headers=headers)
+                else:
+                    conn.request(method, path, headers=headers)
+                
+                response = conn.getresponse()
+                status = response.status
+                response_body = response.read().decode("utf-8")
+                
+                # 成功返回
+                return status, response_body
+                
+            except (socket.timeout, socket.error, ConnectionRefusedError) as e:
+                last_exception = e
+                wait_time = self._backoff_base * (2 ** attempt)
+                logger.warning(
+                    f"Request to {url} failed (attempt {attempt + 1}/{self._max_retries}): {e}, "
+                    f"retrying in {wait_time}s..."
+                )
+                time.sleep(wait_time)
+                
+            except Exception as e:
+                # 其他异常不重试，直接抛出
+                logger.error(f"Unexpected error during request to {url}: {e}")
+                raise
+                
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+        
+        # 所有重试都失败
+        raise last_exception or Exception(f"Failed to connect to {url} after {self._max_retries} retries")
+    
+    def _http_post(self, url: str, data: Dict, headers: Dict) -> Tuple[int, str]:
+        """发送 POST 请求（带重试）"""
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         headers["Content-Length"] = str(len(body))
         
-        if parsed.scheme == "https":
-            conn = http.client.HTTPSConnection(host, port, timeout=self.config.read_timeout)
-        else:
-            conn = http.client.HTTPConnection(host, port, timeout=self.config.read_timeout)
-        
-        try:
-            conn.request("POST", path, body=body, headers=headers)
-            response = conn.getresponse()
-            status = response.status
-            response_body = response.read().decode("utf-8")
-            return status, response_body
-        finally:
-            conn.close()
+        return self._make_request("POST", url, headers, body)
+    
+    def _http_get(self, url: str, headers: Dict) -> Tuple[int, str]:
+        """发送 GET 请求（带重试）"""
+        return self._make_request("GET", url, headers)
     
     def fetch_capture_rules(self) -> bool:
         """
-        从API接口1获取捕获规则列表
+        从API接口1获取捕获规则列表（带重试）
         
         Returns:
             bool: 是否成功获取
         """
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        
+        # 添加认证信息
+        if self.config.api_key:
+            headers["X-API-Key"] = self.config.api_key
+        if self.config.client_id:
+            headers["X-Client-ID"] = self.config.client_id
+        
+        logger.info(f"Fetching capture rules from: {self.config.api_configs_url}")
+        
         try:
-            headers = {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
-            
-            # 添加认证信息
-            if self.config.api_key:
-                headers["X-API-Key"] = self.config.api_key
-            if self.config.client_id:
-                headers["X-Client-ID"] = self.config.client_id
-            
-            logger.info(f"Fetching capture rules from: {self.config.api_configs_url}")
-            
-            parsed = urlparse(self.config.api_configs_url)
-            host = parsed.hostname
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            path = parsed.path or "/"
-            
-            if parsed.scheme == "https":
-                conn = http.client.HTTPSConnection(host, port, timeout=self.config.read_timeout)
-            else:
-                conn = http.client.HTTPConnection(host, port, timeout=self.config.read_timeout)
-            
-            conn.request("GET", path, headers=headers)
-            response = conn.getresponse()
-            status = response.status
-            body = response.read().decode("utf-8")
-            conn.close()
+            # 使用短超时进行规则获取（避免长时间阻塞）
+            status, body = self._make_request(
+                "GET",
+                self.config.api_configs_url,
+                headers,
+                timeout=(3, 10)  # 连接3秒，读取10秒
+            )
             
             if status == 200:
                 data = json.loads(body)
@@ -199,49 +271,51 @@ class APIClient:
         tracking_id: Optional[str] = None,
     ) -> bool:
         """
-        将捕获的数据上报到API接口2
+        将捕获的数据上报到API接口2（带重试）
         
         Args:
             api_id: 匹配的API ID
-            request_data: 请求数据（目标格式：request_data）
-            response_data: 响应数据（目标格式：response_data）
+            request_data: 请求数据
+            response_data: 响应数据
             tracking_id: 当前请求唯一追踪ID
             
         Returns:
             bool: 是否成功上报
         """
-        response = None
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        
+        if self.config.api_key:
+            headers["X-API-Key"] = self.config.api_key
+        if self.config.client_id:
+            headers["X-Client-ID"] = self.config.client_id
+        
+        # 确保 tracking_id 不为空
+        if tracking_id is None:
+            import uuid
+            tracking_id = uuid.uuid4().hex
+            logger.warning(f"tracking_id was None, generated new: {tracking_id}")
+        
+        payload = {
+            "api_id": api_id,
+            "tracking_id": tracking_id,
+            "request_data": request_data,
+            "response_data": response_data,
+        }
+        
+        logger.info(f"Starting upload for api_id={api_id}, tracking_id={tracking_id}")
+        logger.info(f"Upload URL: {self.config.api_upload_url}")
+        
         try:
-            headers = {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
-            
-            if self.config.api_key:
-                headers["X-API-Key"] = self.config.api_key
-            if self.config.client_id:
-                headers["X-Client-ID"] = self.config.client_id
-            
-            # 确保 tracking_id 不为空
-            if tracking_id is None:
-                import uuid
-                tracking_id = uuid.uuid4().hex
-                logger.warning(f"tracking_id was None, generated new: {tracking_id}")
-            
-            payload = {
-                "api_id": api_id,
-                "tracking_id": tracking_id,
-                "request_data": request_data,
-                "response_data": response_data,
-            }
-            
-            logger.info(f"Starting upload for api_id={api_id}, tracking_id={tracking_id}")
-            logger.info(f"Upload URL: {self.config.api_upload_url}")
-            
-            status, response_body = self._http_post(
+            # 上传使用较短的超时（避免阻塞抓包线程）
+            status, response_body = self._make_request(
+                "POST",
                 self.config.api_upload_url,
-                payload,
-                headers
+                headers,
+                json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                timeout=(5, 15)  # 连接5秒，读取15秒
             )
             
             if status == 200:
