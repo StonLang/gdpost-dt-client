@@ -140,19 +140,22 @@ class TransparentProxyHandler:
         response_headers = self._headers_text_to_dict(response_headers_raw or http_info.get("headers", ""))
         response_body_text = self._decode_body(response_body_bytes if response_body_bytes else http_info.get("body", b""))
 
+        try:
+            status_code = int(http_info.get("status_code", 0))
+        except (TypeError, ValueError):
+            status_code = 0
 
-        # aaa = http_info.get("body", b"")
-        # logger.info("1111111111111111")
-        # logger.info(f"response_body_bytes={response_body_bytes}")
-        # logger.info(f"response_body_text={response_body_text}")
-        # logger.info(f"aaa={aaa}")
+        if not 200 <= status_code < 300:
+            logger.info(
+                f"Skipping upload for non-success response status_code={status_code}, api_id={rule.api_id}, tracking_id={tracking_id}"
+            )
+            return True
 
-        # 组装给 API2 的 response_data（按你要求的顶层结构）
+        # 组装给 API2 的 response_data
         content_type = response_headers.get("Content-Type", "").lower()
-        # 按你要求 response_data.body 必须是“对象”。
         # - 若能解析出 JSON：用解析结果
         # - 否则：放入 {"raw": "..."}，避免上传字段类型不一致
-        # 按你的要求：非 JSON 响应 body 直接置空（空对象）
+        # 非 JSON 响应 body 直接置空（空对象）
         response_body_parsed = {}
         if "application/json" in content_type:
             try:
@@ -161,7 +164,7 @@ class TransparentProxyHandler:
                 response_body_parsed = {}
 
         response_data = {
-            "status_code": http_info.get("status_code", 0),
+            "status_code": status_code,
             "headers": response_headers,
             "body": response_body_parsed,
         }
