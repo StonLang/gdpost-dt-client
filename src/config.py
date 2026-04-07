@@ -16,7 +16,7 @@ class ClientConfig:
     
     # 服务端API接口1配置（获取捕获规则）
     # 使用 127.0.0.1 避免 localhost 解析问题，或配置为局域网地址
-    api_base_url: str = field(default="http://127.0.0.1:8000")
+    api_base_url: str = field(default="http://127.0.0.1:9909")
     api_configs_endpoint: str = field(default="/api/v1/api-configs/login")
     
     # 服务端API接口2配置（上报捕获数据）
@@ -51,7 +51,7 @@ class ClientConfig:
     def from_env(cls) -> "ClientConfig":
         """从环境变量加载配置"""
         return cls(
-            api_base_url=os.getenv("API_BASE_URL", "http://127.0.0.1:8000"),
+            api_base_url=os.getenv("API_BASE_URL", "http://127.0.0.1:9909"),
             api_configs_endpoint=os.getenv("API_CONFIGS_ENDPOINT", "/api/v1/api-configs/login"),
             api_upload_endpoint=os.getenv("API_UPLOAD_ENDPOINT", "/api/v1/capture/upload"),
             api_key=os.getenv("API_KEY"),

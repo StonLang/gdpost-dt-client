@@ -222,7 +222,7 @@ notepad .env
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `SERVER_HOST` | localhost | 配置服务器主机地址 |
-| `SERVER_PORT` | 8000 | 配置服务器端口 |
+| `SERVER_PORT` | 9909 | 配置服务器端口 |
 | `SERVER_API_BASE` | /api/v1 | API 基础路径 |
 | `API_KEY` | - | API 认证密钥 |
 | `CLIENT_ID` | - | 客户端标识 |
@@ -241,7 +241,7 @@ notepad .env
 ```ini
 # 配置服务器
 SERVER_HOST=192.168.1.100
-SERVER_PORT=8000
+SERVER_PORT=9909
 API_KEY=your-secret-api-key
 CLIENT_ID=client-windows-01
 
