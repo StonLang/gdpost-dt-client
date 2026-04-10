@@ -6,8 +6,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 from dotenv import load_dotenv
 
-# 加载环境变量
-load_dotenv()
+# 加载环境变量（从项目根目录的 .env 文件）
+_ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+load_dotenv(_ENV_PATH)
 
 
 @dataclass
