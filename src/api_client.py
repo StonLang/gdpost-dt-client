@@ -13,6 +13,7 @@ from urllib.parse import urljoin, urlparse
 import urllib3
 
 from .config import ClientConfig
+from .auth_client import RequestSigner
 
 # 禁用SSL警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -113,6 +114,37 @@ class APIClient:
         self._last_refresh: float = 0
         self._max_retries = 3  # 最大重试次数
         self._backoff_base = 2  # 指数退避基数（秒）
+        self._request_signer: Optional[RequestSigner] = None
+
+        if self.config.private_key_path:
+            self._request_signer = RequestSigner(self.config.private_key_path)
+            logger.info("Request signing enabled with configured private key")
+
+    def _build_signed_headers(
+        self,
+        method: str,
+        url: str,
+        headers: Dict[str, str],
+        body: Optional[bytes] = None,
+    ) -> Dict[str, str]:
+        """
+        构建签名请求头（如果启用私钥签名）
+        """
+        signed_headers = headers.copy()
+        if not self._request_signer:
+            return signed_headers
+        if not self.config.client_id:
+            raise ValueError("CLIENT_ID is required when request signing is enabled")
+
+        parsed = urlparse(url)
+        auth_headers = self._request_signer.get_auth_headers(
+            client_id=self.config.client_id,
+            method=method,
+            path=parsed.path or "/",
+            body=body,
+        )
+        signed_headers.update(auth_headers)
+        return signed_headers
     
     def _make_request(
         self,
@@ -235,6 +267,7 @@ class APIClient:
         logger.info(f"Fetching capture rules from: {self.config.api_configs_url}")
         
         try:
+            headers = self._build_signed_headers("GET", self.config.api_configs_url, headers)
             # 使用短超时进行规则获取（避免长时间阻塞）
             status, body = self._make_request(
                 "GET",
@@ -304,6 +337,13 @@ class APIClient:
             "request_data": request_data,
             "response_data": response_data,
         }
+        payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = self._build_signed_headers(
+            "POST",
+            self.config.api_upload_url,
+            headers,
+            body=payload_bytes,
+        )
         
         logger.info(f"Starting upload for api_id={api_id}, tracking_id={tracking_id}")
         logger.info(f"Upload URL: {self.config.api_upload_url}")
@@ -314,7 +354,7 @@ class APIClient:
                 "POST",
                 self.config.api_upload_url,
                 headers,
-                json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                payload_bytes,
                 timeout=(5, 15)  # 连接5秒，读取15秒
             )
             

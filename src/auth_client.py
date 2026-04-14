@@ -27,13 +27,34 @@ class RequestSigner:
     
     def _load_private_key(self):
         """从文件加载私钥"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # 检查文件是否存在
+        if not os.path.exists(self.private_key_path):
+            raise FileNotFoundError(f"私钥文件不存在: {self.private_key_path}")
+        
+        # 检查文件是否为空
+        if os.path.getsize(self.private_key_path) == 0:
+            raise ValueError(f"私钥文件为空: {self.private_key_path}")
+        
         with open(self.private_key_path, 'rb') as f:
             key_data = f.read()
-        return serialization.load_pem_private_key(
-            key_data,
-            password=None,
-            backend=default_backend()
-        )
+        
+        try:
+            return serialization.load_pem_private_key(
+                key_data,
+                password=None,
+                backend=default_backend()
+            )
+        except Exception as e:
+            logger.error(f"私钥文件格式错误: {self.private_key_path}")
+            logger.error(f"错误详情: {e}")
+            raise ValueError(
+                f"私钥文件格式不正确或已损坏: {self.private_key_path}\n"
+                f"请确保文件是有效的PEM格式RSA私钥，且没有被额外修改。\n"
+                f"错误详情: {e}"
+            )
     
     @staticmethod
     def generate_key_pair() -> tuple:

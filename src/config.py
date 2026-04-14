@@ -26,6 +26,7 @@ class ClientConfig:
     # 认证信息
     api_key: Optional[str] = field(default=None)
     client_id: Optional[str] = field(default="client-001")
+    private_key_path: Optional[str] = field(default=None)
     
     # 轮询间隔（秒），默认5分钟
     poll_interval: int = field(default=300)
@@ -57,6 +58,7 @@ class ClientConfig:
             api_upload_endpoint=os.getenv("API_UPLOAD_ENDPOINT", "/api/v1/capture/upload"),
             api_key=os.getenv("API_KEY"),
             client_id=os.getenv("CLIENT_ID", "client-001"),
+            private_key_path=os.getenv("PRIVATE_KEY_PATH"),
             poll_interval=int(os.getenv("POLL_INTERVAL", "300")),
             log_dir=os.getenv("LOG_DIR", "logs"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
