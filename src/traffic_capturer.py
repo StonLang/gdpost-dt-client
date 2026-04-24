@@ -45,7 +45,8 @@ class TrafficCapturer:
         self._packet_callback: Optional[Callable] = None
 
         # 抓包线程只负责 send+enqueue，不做重解析/上报，避免拖慢浏览器（reinjection 速度）。
-        self._packet_queue: "queue.Queue[Optional[_CapturedPacket]]" = queue.Queue(maxsize=2000)
+        # 队列容量增大到 10000，宁可丢包也不能阻塞网络
+        self._packet_queue: "queue.Queue[Optional[_CapturedPacket]]" = queue.Queue(maxsize=10000)
         self._worker_thread: Optional[threading.Thread] = None
         self._dropped_packets = 0
         self._last_drop_log_ts = 0.0
@@ -130,14 +131,19 @@ class TrafficCapturer:
         """解析/回调在独立线程执行（可能较慢，但不能阻塞抓包 reinject）"""
         packet_count = 0
         while True:
-            item = self._packet_queue.get()
+            try:
+                # 使用超时获取，避免永久阻塞
+                item = self._packet_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            
             try:
                 if item is None:
                     return
                 
                 # 定期让出 GIL，避免阻塞其他线程
                 packet_count += 1
-                if packet_count % 50 == 0:
+                if packet_count % 100 == 0:
                     time.sleep(0.001)  # 1ms 让出 GIL
                 
                 self._process_packet(item)
@@ -211,14 +217,16 @@ class TrafficCapturer:
                                     dst_port=int(packet.dst_port),
                                     payload=bytes(payload),
                                 )
+                                # 使用 put_nowait 非阻塞入队，队列满时直接丢弃（优先保证网络）
                                 try:
                                     self._packet_queue.put_nowait(captured)
                                 except queue.Full:
                                     self._dropped_packets += 1
+                                    # 降低日志频率，每60秒打印一次丢包统计
                                     now = time.time()
-                                    if now - self._last_drop_log_ts > 10:
+                                    if now - self._last_drop_log_ts > 60:
                                         self._last_drop_log_ts = now
-                                        logger.warning(f"Packet queue full, dropped={self._dropped_packets}")
+                                        logger.debug(f"Packet queue full, dropped={self._dropped_packets}")
                                 # 该包已处理完
                                 continue
 
@@ -238,14 +246,15 @@ class TrafficCapturer:
                                     dst_port=int(packet.dst_port),
                                     payload=bytes(payload),
                                 )
+                                # 非阻塞入队，优先保证网络畅通
                                 try:
                                     self._packet_queue.put_nowait(captured)
                                 except queue.Full:
                                     self._dropped_packets += 1
                                     now = time.time()
-                                    if now - self._last_drop_log_ts > 10:
+                                    if now - self._last_drop_log_ts > 60:
                                         self._last_drop_log_ts = now
-                                        logger.warning(f"Packet queue full, dropped={self._dropped_packets}")
+                                        logger.debug(f"Packet queue full, dropped={self._dropped_packets}")
                     except Exception as e:
                         print(f"[ERROR] Processing packet: {e}")
                         logger.debug(f"Error processing packet: {e}")
