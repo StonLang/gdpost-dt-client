@@ -1,426 +1,308 @@
 # gdpost-dt-client
 
-基于 WinDivert 的 Windows 透明代理客户端。
+Windows 平台网络流量自动采集客户端。基于 WinDivert 底层驱动捕获浏览器与服务端的 HTTP/HTTPS 通信，智能匹配服务端下发的业务接口规则，自动解析请求/响应数据并上报服务端进行后续处理。
 
 ## 项目概述
 
-`gdpost-dt-client` 是一个 Windows 平台的透明代理客户端，通过 WinDivert 驱动在内核层捕获网络流量，根据配置的规则智能分流 HTTP/HTTPS 请求。
+**核心目标**：在用户无感知的情况下，透明抓取指定业务接口的网络流量，提取完整的请求/响应数据并实时上报服务端。
 
-## 核心特性
+**业务场景**：
+- 透明抓包：基于 WinDivert 驱动捕获底层 TCP 网络包，不影响浏览器正常使用
+- 智能匹配：根据服务端下发的规则自动识别目标业务接口
+- 请求/响应配对：通过五元组关联同一 HTTP 事务的请求和响应
+- 自动上报：匹配成功的完整请求/响应数据通过线程池异步上报服务端
+- RSA 签名认证：防止非法客户端伪造数据上报，请求可追溯、防重放
 
-- **内核层流量捕获**：使用 WinDivert 在 Windows 内核层透明捕获网络流量
-- **智能流量分流**：根据规则配置，自动判断请求是否走代理
-- **HTTP/HTTPS 完整支持**：支持 HTTP 明文代理和 HTTPS CONNECT 隧道
-- **动态规则同步**：每 5 分钟自动从配置服务器刷新代理规则
-- **请求标记追踪**：代理请求自动添加 `x-api-id` 头部，便于追踪和统计
-- **零配置感知**：对浏览器和其他应用程序完全透明，无需修改代理设置
+## 核心功能模块
 
-## 系统架构
+### 1. WinDivert 流量捕获（底层驱动）
+- **驱动调用**：基于 `pydivert`（WinDivert）捕获底层网络包，需管理员权限
+- **过滤器配置**：仅捕获 TCP 流量，排除本地回环（`ip.DstAddr != 127.0.0.1`）
+- **立即重新注入**：抓包后立即 `packet.send()` 放回网络，保证浏览器通信畅通
+- **管理员权限检测**：启动时自动检测，无权限则降级为仅轮询模式
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        gdpost-dt-client                          │
-│                     (Windows 透明代理客户端)                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────┐ │
-│  │ Traffic Capturer │  │   Server Client  │  │ Proxy Handler   │ │
-│  │  (WinDivert)     │  │   (API Client)   │  │  (HTTP Proxy)   │ │
-│  └────────┬─────────┘  └────────┬─────────┘  └────────┬────────┘ │
-│           │                   │                    │             │
-│           │ Capture           │ Get Config         │ Forward     │
-│           │                   │                    │             │
-│  ┌────────▼─────────┐         │              ┌─────▼──────┐      │
-│  │   Packet Parser  │         │              │  Upstream  │      │
-│  │  (HTTP Parser)   │         │              │   Proxy    │      │
-│  └────────┬─────────┘         │              └────────────┘      │
-│           │                   │                                  │
-│           └───────────────────┼──────────────────────────────────┘
-│                               │
-│  ┌────────────────────────────▼────────────────────────────┐     │
-│  │              Rule Matcher (Config Refresh)                │   │
-│  └───────────────────────────────────────────────────────────┘   │
-└───────────────────────────────────────────────────────────────── ┘
-           │
-           │ WinDivert Driver (Kernel Layer)
-           │
-┌──────────▼───────────────────────────────────────────────────┐
-│                   Network Stack (Windows Kernel)             │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐      │
-│  │ Browser  │  │   App    │  │   App    │  │   App    │      │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘      │
-└──────────────────────────────────────────────────────────────┘
-```
+### 2. 双线程高性能架构
+- **捕获线程**（`TrafficCaptureThread`）：专用线程高速捕获网络包，只做 `send+enqueue`
+- **解析工作线程**（`TrafficParseWorker`）：从队列取出数据包，解析 HTTP、匹配规则、触发上报
+- **线程安全**：队列、字典等共享资源加锁保护
+- **大容量队列**：10000 容量，非阻塞入队（满时丢弃新包，零阻塞网络）
+- **丢包统计**：每分钟记录丢包数量，可观测
 
-## 模块说明
+### 3. HTTP 响应重组
+- **响应流缓冲**：缓存多包响应数据，按 flow_key 累积
+- **流超时清理**：30 秒无新数据自动清理缓存
+- **缓冲区限制**：单个响应最大 256KB，防内存溢出
+- **重复日志防护**：防止同一错误重复记录
 
-### 1. Traffic Capturer (`src/traffic_capturer.py`)
+### 4. 透明代理处理与规则匹配
+- **规则匹配检查**：检查请求是否命中捕获规则（方法、协议、主机、端口、路径）
+- **未匹配透传**：不匹配的规则直接放行，不做任何处理
+- **会话创建**：为匹配请求创建唯一 `tracking_id`
+- **请求数据组装**：提取方法、URL、Header、Body、Query 参数
+- **数据截断**：超过 200KB 的请求体截断后上传
+- **响应配对**：根据源/目标地址（flow_key）找到对应请求
+- **异步上传**：5 个工作线程的线程池异步上报，不阻塞抓包
 
-使用 WinDivert 捕获网络流量的核心模块。
+### 5. 规则引擎（与服务端联动）
+- **初始规则获取**：启动时从服务端拉取接口捕获规则（`GET /api/v1/api-configs/login`）
+- **后台规则刷新**：定时（默认 5 分钟）从服务端更新捕获规则
+- **失败重试机制**：规则获取失败时 30 秒后重试，成功恢复 5 分钟间隔
+- **分段等待设计**：1 秒步长等待，支持及时响应停止信号
+- **匹配维度**：HTTP 方法、协议、主机、端口（0 表示任意）、路径（`*` 结尾为前缀匹配）
 
-**功能**：
-- 在内核层拦截 HTTP/HTTPS 出入站流量
-- 解析 TCP 数据包，提取 HTTP 请求/响应信息
-- 回调机制通知代理处理器
+### 6. API 通信与 RSA 签名认证
+- **规则获取接口**：调用服务端获取捕获规则（含重试、指数退避）
+- **数据上报接口**：`POST /api/v1/capture/upload` 上报捕获数据
+- **RSA 签名**：`METHOD|PATH|TIMESTAMP|BODY_SHA256` 签名，Base64 编码
+- **认证头**：`X-Client-ID`、`X-Timestamp`、`X-Signature`
+- **防重放攻击**：时间戳机制
 
-**关键类**：
-- `TrafficCapturer`: 流量捕获主类
+### 7. 配置管理
+- **.env 文件加载**：从环境变量文件读取所有配置
+- **环境变量覆盖**：系统环境变量优先
+- **关键配置项**：
+  - `API_BASE_URL` — 服务端地址
+  - `CLIENT_ID` / `PRIVATE_KEY_PATH` — 客户端标识与 RSA 私钥
+  - `POLL_INTERVAL` — 规则刷新间隔（秒）
+  - `DIVERT_FILTER` — WinDivert 抓包过滤规则
+  - `LOG_LEVEL` / `LOG_RETENTION_DAYS` — 日志级别与保留天数
 
-### 2. Server Client (`src/api_client.py`)
+### 8. 日志系统
+- **控制台输出**：实时显示运行日志
+- **文件日志**：按天生成日志文件（`logs/gdpost-dt-client-YYYY-MM-DD.log`）
+- **自动清理**：自动删除超期日志（可配置保留天数）
+- **匹配请求日志**：单独记录匹配成功的请求（方法、URL、API ID、上传状态）
 
-与配置服务器通信的客户端模块。
-
-**功能**：
-- 从配置服务器获取代理规则配置
-- 每 5 分钟自动刷新配置
-- 规则匹配算法
-
-**关键类**：
-- `ServerClient`: API 客户端主类
-- `ApiConfig`: 代理规则配置项
-
-### 3. Proxy Handler (`src/proxy_handler.py`)
-
-HTTP 代理请求处理模块。
-
-**功能**：
-- 本地 HTTP 代理服务器
-- 请求匹配和转发逻辑
-- 添加 `x-api-id` 代理头部
-- HTTPS CONNECT 隧道支持
-
-**关键类**：
-- `ProxyHandler`: HTTP 请求处理器
-- `ProxyServer`: 代理服务器
-- `TransparentProxyHandler`: 透明代理处理器
-
-### 4. Configuration (`src/config.py`)
-
-配置管理模块。
-
-**功能**：
-- 环境变量加载
-- 默认配置管理
-- 配置验证
-
-### 5. Main Entry (`src/main.py`)
-
-程序入口和生命周期管理。
-
-**功能**：
-- 初始化各模块
-- 启动流量捕获和代理服务
-- 信号处理和优雅退出
-
-## 工作流程
-
-```
-1. 启动阶段
-   └─> 从配置服务器获取代理规则
-   └─> 启动本地代理服务器
-   └─> 启动 WinDivert 流量捕获
-
-2. 请求处理流程
-   
-   浏览器 ──HTTP──> WinDivert (内核)
-                      │
-                      ▼
-               Packet Capturer
-                      │
-                      ▼
-               HTTP Parser ──> 提取 (Method, Host, Port, Path)
-                      │
-                      ▼
-               Rule Matcher ──> 对比代理规则
-                      │
-              ┌────────┴────────┐
-              │                 │
-           Match            No Match
-              │                 │
-              ▼                 ▼
-       Add x-api-id          Direct
-       Forward to            Connect
-       Proxy Server          Target
-              │                 │
-              └────────┬────────┘
-                       ▼
-                  Return Response
-                       │
-                       ▼
-                    Browser
-
-3. 配置刷新
-   └─> 每 5 分钟调用配置服务器接口
-   └─> 更新本地代理规则缓存
-```
+### 9. 部署与运行模式
+- **开发模式**：`python -m src.main` 直接运行，或 `run.bat` 一键启动
+- **Windows 服务**：`main_cli.py` 封装为 Windows Service（install / run / uninstall）
+- **打包发布**：PyInstaller 单文件 exe + Inno Setup 安装程序
 
 ## 项目结构
 
 ```
 gdpost-dt-client/
-├── src/                          # 源代码目录
-│   ├── __init__.py              # 包初始化
-│   ├── config.py                # 配置管理模块
-│   ├── api_client.py            # 配置服务器 API 客户端
-│   ├── traffic_capturer.py      # WinDivert 流量捕获
-│   ├── proxy_handler.py         # 代理转发逻辑
-│   └── main.py                  # 主程序入口
-├── venv/                         # 虚拟环境（本地创建）
-├── .env.example                  # 环境变量示例配置
-├── .env                          # 实际环境变量配置（不提交）
-├── requirements.txt              # Python 依赖列表
-├── run.bat                       # Windows 启动脚本
-└── README.md                     # 项目文档
+├── src/                      # 源代码目录
+│   ├── main.py               # 程序入口（启动捕获、代理、规则刷新循环）
+│   ├── config.py             # 配置管理（.env 驱动，dataclass）
+│   ├── api_client.py         # API 客户端（规则获取、数据上报、规则匹配）
+│   ├── traffic_capturer.py   # WinDivert 流量捕获器（双线程 + 队列）
+│   ├── proxy_handler.py      # 透明代理处理器（配对、匹配、异步上报）
+│   ├── auth_client.py        # RSA 签名工具（RequestSigner）
+│   ├── signed_api_client.py  # 带签名的 API 客户端包装类
+│   └── logger.py             # 日志配置（控制台 + 按天归档）
+├── keys/                     # RSA 密钥存放目录
+├── logs/                     # 日志目录（运行时创建）
+├── venv/                     # Python 虚拟环境
+├── .env.example              # 环境变量示例
+├── .env                      # 本地环境变量（.gitignore）
+├── requirements.txt          # Python 依赖
+├── entry.py                  # PyInstaller 打包入口
+├── main_cli.py               # Windows 服务封装（pywin32）
+├── run.bat                   # Windows 一键启动脚本（检查权限、环境、依赖）
+├── build.spec                # PyInstaller 打包配置
+├── installer.iss             # Inno Setup 安装程序配置
+├── BUILD.md                  # 打包与发布详细指南
+└── README.md                 # 项目说明
 ```
 
-## 安装指南
+## 快速开始
 
-### 系统要求
+### 1. 环境准备
 
-- **操作系统**: Windows 10/11 (64位)
-- **Python**: 3.8+
-- **权限**: 需要管理员权限（WinDivert 驱动要求）
-- **网络**: 需要访问配置服务器的网络连接
-
-### 安装步骤
-
-1. **进入项目目录**
+**前置要求**：
+- Windows 系统（WinDivert 仅支持 Windows）
+- Python 3.11+
+- 管理员权限（WinDivert 驱动需要）
 
 ```bash
-cd G:\vscode-workspace\gdpost-dt-client
-```
-
-2. **创建虚拟环境**
-
-```bash
+# 克隆项目
 cd gdpost-dt-client
+
+# 创建虚拟环境
 python -m venv venv
+
+# 激活（Windows）
 venv\Scripts\activate
-```
 
-3. **安装依赖**
-
-```bash
+# 安装依赖
 pip install -r requirements.txt
 ```
 
-**注意**: WinDivert 驱动会在首次运行时自动安装，需要管理员权限。
-
-## 配置说明
-
-### 环境变量配置
-
-复制示例配置文件并修改：
+### 2. 配置环境变量
 
 ```bash
-copy .env.example .env
-notepad .env
+# 复制示例配置
+cp .env.example .env
+
+# 编辑 .env 文件，配置服务端地址、客户端ID、私钥路径等
 ```
 
-### 配置项说明
+### 3. 启动服务
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `SERVER_HOST` | localhost | 配置服务器主机地址 |
-| `SERVER_PORT` | 9909 | 配置服务器端口 |
-| `SERVER_API_BASE` | /api/v1 | API 基础路径 |
-| `API_KEY` | - | API 认证密钥 |
-| `CLIENT_ID` | - | 客户端标识 |
-| `DIVERT_FILTER` | tcp | WinDivert 过滤规则（默认全部 TCP，不限制 IP/端口） |
-| `PROXY_HOST` | 127.0.0.1 | 上级代理主机 |
-| `PROXY_PORT` | 1080 | 上级代理端口 |
-| `CONFIG_REFRESH_INTERVAL` | 300 | 配置刷新间隔（秒） |
-| `API_ID_HEADER` | x-api-id | API ID 头部名称 |
-| `LOG_LEVEL` | INFO | 日志级别 |
-| `CONNECT_TIMEOUT` | 30 | 连接超时（秒） |
+**方式一：一键启动脚本（推荐）**
 
-`DIVERT_FILTER` 使用 `tcp` 时，会捕获本机**全部 TCP**（不限制源/目的 IP 与端口，含入站与出站），便于关联请求与响应。若只希望抓取出站、降低开销，可改为 `tcp and outbound`。
-
-### 示例配置
-
-```ini
-# 配置服务器
-SERVER_HOST=192.168.1.100
-SERVER_PORT=9909
-API_KEY=your-secret-api-key
-CLIENT_ID=client-windows-01
-
-# 上级代理服务器（暂用本地，后续更换）
-PROXY_HOST=127.0.0.1
-PROXY_PORT=1080
-
-# 日志级别
-LOG_LEVEL=INFO
-```
-
-## 使用说明
-
-### 方法一：使用启动脚本（推荐）
-
-双击运行 `run.bat`，脚本会自动：
-1. 检查并请求管理员权限
-2. 激活虚拟环境
-3. 检查并安装依赖
-4. 启动客户端
-
+右键以管理员身份运行：
 ```bash
 run.bat
 ```
 
-### 方法二：命令行手动启动
+脚本会自动：
+1. 检查管理员权限
+2. 创建/激活虚拟环境
+3. 安装缺失依赖
+4. 启动客户端
 
-**需要以管理员身份运行 PowerShell**
+**方式二：命令行启动**
 
-```powershell
-# 以管理员身份运行 PowerShell
-# 然后执行:
-cd G:\vscode-workspace\gdpost-dt-client
-venv\Scripts\activate
+```bash
+# 管理员权限 CMD
 python -m src.main
 ```
 
-### 方法三：创建快捷方式
+### 4. 停止服务
 
-创建带管理员权限的快捷方式：
+按 `Ctrl+C` 或发送终止信号，客户端会：
+1. 广播停止事件
+2. 关闭 WinDivert 驱动
+3. 等待线程池任务完成
+4. 释放资源
 
-1. 右键 `run.bat` -> 发送到桌面快捷方式
-2. 右键快捷方式 -> 属性 -> 高级 -> 勾选"以管理员身份运行"
+## 配置说明
 
-### 停止客户端
+```env
+# 服务端 API
+API_BASE_URL=http://localhost:9909
+API_CONFIGS_ENDPOINT=/api/v1/api-configs/login
+API_UPLOAD_ENDPOINT=/api/v1/capture/upload
 
-- 在运行窗口按 `Ctrl + C`
-- 或关闭 PowerShell 窗口
+# 认证
+CLIENT_ID=client-windows-01
+PRIVATE_KEY_PATH=./keys/client_private_key.pem
 
-## 规则匹配逻辑
+# 轮询间隔（秒），默认 5 分钟
+POLL_INTERVAL=300
 
-### 匹配字段
+# 日志
+LOG_DIR=logs
+LOG_LEVEL=INFO
+LOG_RETENTION_DAYS=30
 
-| 字段 | 类型 | 匹配方式 | 示例 |
-|------|------|---------|------|
-| `request_method` | string | 精确匹配或 `*` 通配符 | `GET`, `POST`, `*`, `PUT` |
-| `request_protocol` | string | 精确匹配或 `*` | `http`, `https`, `*` |
-| `request_host` | string | 精确匹配或子域名通配 | `example.com`, `*.example.com`, `*` |
-| `request_port` | int | 精确匹配或 `0`（任意） | `80`, `443`, `0` |
-| `request_path` | string | 前缀匹配或通配符 | `/api/*`, `/v1/*`, `*` |
+# WinDivert 过滤器
+capture and ip.DstAddr != 127.0.0.1 and ip.SrcAddr != 127.0.0.1
+DIVERT_PRIORITY=0
 
-### 匹配示例
-
-**规则**: 
-```json
-{
-  "api_id": "api-001",
-  "request_method": "GET",
-  "request_protocol": "http",
-  "request_host": "api.example.com",
-  "request_port": 80,
-  "request_path": "/api/*"
-}
+# HTTP 超时
+CONNECT_TIMEOUT=10
+READ_TIMEOUT=30
 ```
 
-**匹配情况**:
-- ✅ `GET http://api.example.com/api/users` - 匹配
-- ✅ `GET http://api.example.com/api/items/1` - 匹配
-- ❌ `POST http://api.example.com/api/users` - 方法不匹配
-- ❌ `GET http://other.com/api/users` - 主机不匹配
-- ❌ `GET http://api.example.com:8080/api/users` - 端口不匹配
+## 打包与发布
 
-**子域名匹配**:
-```json
-{
-  "request_host": "*.example.com"
-}
-```
-匹配: `api.example.com`, `www.example.com`, `sub.example.com`
+### 生成 RSA 密钥对（首次部署）
 
-## 代理转发机制
-
-### HTTP 请求
-
-1. 捕获请求 `GET http://target.com/path`
-2. 匹配规则 `api_id=xxx`
-3. 添加头部 `x-api-id: xxx`
-4. 转发到代理服务器
-5. 代理服务器转发到目标
-6. 返回响应
-
-### HTTPS 请求 (CONNECT 隧道)
-
-1. 捕获 `CONNECT target.com:443`
-2. 匹配规则
-3. 与代理服务器建立 CONNECT 隧道，携带 `x-api-id`
-4. 隧道建立后，双向转发加密数据
-
-## 日志说明
-
-### 日志级别
-
-- `DEBUG`: 详细的数据包信息和匹配过程
-- `INFO`: 启动/停止信息、配置刷新、代理转发记录
-- `WARNING`: 配置刷新失败、连接警告
-- `ERROR`: 错误和异常
-
-### 查看日志
-
-```powershell
-# 在 PowerShell 中运行，日志直接输出到控制台
-python -m src.main
-
-# 保存日志到文件
-python -m src.main 2>&1 | Tee-Object -FilePath client.log
+```bash
+python -c "from src.auth_client import RequestSigner; pk, pub = RequestSigner.generate_key_pair(); RequestSigner.save_key(pk, './keys/client_private_key.pem'); RequestSigner.save_key(pub, './keys/client_public_key.pem')"
 ```
 
-## 故障排查
+### 打包为单文件 exe
 
-### 问题：无法安装 pydivert
+```bash
+# 安装打包工具
+pip install pyinstaller pywin32
 
-**解决**: 确保以管理员权限运行 pip，且已安装 Visual C++ Redistributable
+# 执行打包
+pyinstaller build.spec
 
-### 问题：WinDivert 启动失败
-
-**可能原因**: 
-- 未以管理员权限运行
-- 驱动签名验证失败（测试模式未开启）
-
-**解决**:
-```powershell
-# 以管理员运行
-# 启用测试模式（开发环境）
-bcdedit /set testsigning on
-# 重启电脑
+# 或直接命令行打包
+pyinstaller --onefile --console --name GdpostClient --hidden-import win32service --hidden-import win32serviceutil --hidden-import win32event --hidden-import servicemanager main_cli.py
 ```
 
-### 问题：无法连接到配置服务器
+打包产物：`dist/GdpostClient.exe`
 
-**检查**:
-1. 配置服务器是否启动
-2. 防火墙是否放行端口
-3. `.env` 中 `SERVER_HOST` 和 `SERVER_PORT` 是否正确
+### 创建安装程序（可选）
 
-### 问题：流量未被代理
+1. 安装 [Inno Setup](https://jrsoftware.org/isinfo.php)
+2. 打开 `installer.iss`
+3. 点击 **Build** -> **Compile**
+4. 输出：`installer_output/GDPost_DT_Client_Setup_v1.0.0.exe`
 
-**检查**:
-1. 检查配置服务器返回的规则是否正确
-2. 检查日志中的匹配过程
-3. 确认 `is_active` 为 `true`
+### 部署为 Windows 服务
 
-## 安全注意事项
+```cmd
+# 安装并启动服务（管理员权限）
+GdpostClient.exe install
 
-1. **权限控制**: 客户端需要管理员权限运行，请确保在安全环境中部署
-2. **API 密钥**: 妥善保管 `API_KEY`，不要硬编码在代码中
-3. **代理循环**: 确保代理服务器地址不在代理规则中，避免无限循环
-4. **驱动安全**: WinDivert 是内核驱动，仅从可信来源安装
+# 查看服务状态
+sc query GdpostClient
 
-## 开发计划
+# 停止服务
+net stop GdpostClient
 
-- [ ] 支持 SOCKS5 代理协议
-- [ ] 添加流量统计和上报功能
-- [ ] 支持 WebSocket 代理
-- [ ] GUI 管理界面
-- [ ] 支持 Windows 服务方式运行
-- [ ] 配置文件热重载
+# 卸载服务
+GdpostClient.exe uninstall
+```
 
-## License
+更多打包细节参考 [BUILD.md](BUILD.md)。
+
+## 运行模式
+
+### 模式一：完整抓包模式（推荐）
+
+**前提**：管理员权限 + WinDivert 驱动可用
+
+**功能**：
+- 实时网络抓包
+- 智能规则匹配
+- 请求/响应自动关联
+- 数据实时上报
+
+### 模式二：仅轮询模式（降级）
+
+**前提**：无管理员权限或驱动不可用
+
+**功能**：
+- 定时获取规则
+- 无抓包功能
+- 基础日志记录
+
+## 技术栈
+
+| 层级 | 技术选型 |
+|------|----------|
+| 开发语言 | Python 3.11 |
+| 抓包驱动 | WinDivert（pydivert） |
+| HTTP 客户端 | http.client + urllib3 |
+| 加密算法 | cryptography（RSA） |
+| 配置管理 | python-dotenv |
+| 打包工具 | PyInstaller |
+| 安装程序 | Inno Setup |
+| 操作系统 | Windows（需管理员权限） |
+
+## 业务价值
+
+1. **透明采集**：用户无感知，不影响浏览器正常使用
+2. **实时上报**：数据捕获后立即上报服务端处理
+3. **智能匹配**：只采集配置的接口，过滤无关流量
+4. **安全可靠**：RSA 签名认证，防止伪造和抵赖
+5. **高可用**：支持降级模式，保证核心功能可用
+6. **易于部署**：提供安装程序，一键安装运行
+
+## 依赖服务端功能
+
+| 客户端功能 | 依赖服务端接口 | 说明 |
+|-----------|----------------|------|
+| 规则获取 | `GET /api/v1/api-configs/login` | 获取接口捕获规则 |
+| 数据上报 | `POST /api/v1/capture/upload` | 上报捕获的请求/响应数据 |
+| 身份认证 | RSA 签名验证 | 服务端验证客户端身份 |
+
+## 风险与注意事项
+
+1. **管理员权限**：WinDivert 驱动需要管理员权限才能加载
+2. **驱动兼容性**：需测试不同 Windows 版本的兼容性
+3. **网络性能**：高并发场景可能丢包，需监控丢包率
+4. **安全合规**：抓包涉及用户隐私，需合规审查
+
+## 许可证
 
 MIT License
-
-Copyright (c) 2024 StonLang
